@@ -11,6 +11,7 @@
   --band: #eef1f5;
   --extruding: #2a78d6;
   --held: #eb6834;
+  --anchored: #6f7480;
   --probe: #7d4fd1;
   --focus: #2a78d6;
   --warn: #9a5b00;
@@ -28,6 +29,7 @@
     --band: #1e2126;
     --extruding: #3987e5;
     --held: #d95926;
+    --anchored: #9aa0ab;
     --probe: #a07cf0;
     --focus: #3987e5;
     --warn: #e0a64f;
@@ -45,6 +47,7 @@
   --band: #1e2126;
   --extruding: #3987e5;
   --held: #d95926;
+  --anchored: #9aa0ab;
   --probe: #a07cf0;
   --focus: #3987e5;
   --warn: #e0a64f;
