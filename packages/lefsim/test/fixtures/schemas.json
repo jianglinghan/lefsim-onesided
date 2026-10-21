@@ -1,0 +1,225 @@
+{
+ "lattice": {
+  "metadata": {
+   "lefsim.kind": "lattice",
+   "lefsim.n_sites": "200"
+  },
+  "fields": [
+   {
+    "name": "site",
+    "type": "uint32",
+    "nullable": false,
+    "dictionary": null
+   },
+   {
+    "name": "captures_from",
+    "type": "dict<uint8,utf8>",
+    "nullable": false,
+    "dictionary": [
+     "Left",
+     "Right"
+    ]
+   },
+   {
+    "name": "strength",
+    "type": "float64",
+    "nullable": false,
+    "dictionary": null
+   }
+  ]
+ },
+ "lefs": {
+  "metadata": {
+   "lefsim.kind": "lefs",
+   "lefsim.n_lefs": "4"
+  },
+  "fields": [
+   {
+    "name": "lef_id",
+    "type": "uint32",
+    "nullable": false,
+    "dictionary": null
+   },
+   {
+    "name": "left_pos",
+    "type": "uint32",
+    "nullable": false,
+    "dictionary": null
+   },
+   {
+    "name": "right_pos",
+    "type": "uint32",
+    "nullable": false,
+    "dictionary": null
+   },
+   {
+    "name": "left_mobility",
+    "type": "dict<uint8,utf8>",
+    "nullable": false,
+    "dictionary": [
+     "Moving",
+     "Captured",
+     "Anchored"
+    ]
+   },
+   {
+    "name": "right_mobility",
+    "type": "dict<uint8,utf8>",
+    "nullable": false,
+    "dictionary": [
+     "Moving",
+     "Captured",
+     "Anchored"
+    ]
+   }
+  ]
+ },
+ "snapshots_lef": {
+  "metadata": {
+   "lefsim.kind": "lefs",
+   "lefsim.n_lefs": "4"
+  },
+  "fields": [
+   {
+    "name": "time",
+    "type": "float64",
+    "nullable": false,
+    "dictionary": null
+   },
+   {
+    "name": "lef_id",
+    "type": "uint32",
+    "nullable": false,
+    "dictionary": null
+   },
+   {
+    "name": "left_pos",
+    "type": "uint32",
+    "nullable": false,
+    "dictionary": null
+   },
+   {
+    "name": "right_pos",
+    "type": "uint32",
+    "nullable": false,
+    "dictionary": null
+   },
+   {
+    "name": "left_mobility",
+    "type": "dict<uint8,utf8>",
+    "nullable": false,
+    "dictionary": [
+     "Moving",
+     "Captured",
+     "Anchored"
+    ]
+   },
+   {
+    "name": "right_mobility",
+    "type": "dict<uint8,utf8>",
+    "nullable": false,
+    "dictionary": [
+     "Moving",
+     "Captured",
+     "Anchored"
+    ]
+   }
+  ]
+ },
+ "snapshots_leg": {
+  "metadata": {
+   "lefsim.kind": "legs",
+   "lefsim.n_lefs": "4"
+  },
+  "fields": [
+   {
+    "name": "time",
+    "type": "float64",
+    "nullable": false,
+    "dictionary": null
+   },
+   {
+    "name": "leg_id",
+    "type": "uint32",
+    "nullable": false,
+    "dictionary": null
+   },
+   {
+    "name": "lef_id",
+    "type": "uint32",
+    "nullable": false,
+    "dictionary": null
+   },
+   {
+    "name": "pos",
+    "type": "uint32",
+    "nullable": false,
+    "dictionary": null
+   },
+   {
+    "name": "mobility",
+    "type": "dict<uint8,utf8>",
+    "nullable": false,
+    "dictionary": [
+     "Moving",
+     "Captured",
+     "Anchored"
+    ]
+   }
+  ]
+ },
+ "events": {
+  "metadata": {
+   "lefsim.kind": "events"
+  },
+  "fields": [
+   {
+    "name": "time",
+    "type": "float64",
+    "nullable": false,
+    "dictionary": null
+   },
+   {
+    "name": "leg_id",
+    "type": "uint32",
+    "nullable": false,
+    "dictionary": null
+   },
+   {
+    "name": "lef_id",
+    "type": "uint32",
+    "nullable": false,
+    "dictionary": null
+   },
+   {
+    "name": "pos",
+    "type": "uint32",
+    "nullable": false,
+    "dictionary": null
+   },
+   {
+    "name": "mobility",
+    "type": "dict<uint8,utf8>",
+    "nullable": false,
+    "dictionary": [
+     "Moving",
+     "Captured",
+     "Anchored"
+    ]
+   },
+   {
+    "name": "action",
+    "type": "dict<uint8,utf8>",
+    "nullable": false,
+    "dictionary": [
+     "Step",
+     "Respawn",
+     "Keyframe",
+     "Evict",
+     "CtcfBind",
+     "CtcfRelease"
+    ]
+   }
+  ]
+ }
+}

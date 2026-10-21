@@ -1,0 +1,37 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+# Keep bare `cargo build` / `cargo test` on the core crate. Binding crates
+# (cdylibs) may need toolchains that aren't installed.
+default-members = ["crates/lefsim"]
+
+# One version for the core crate and both bindings (the Python wheel reads it
+# through maturin; packages/lefsim/package.json is kept in step by
+# scripts/bump-version.sh). See "Releasing" in the README.
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/abdenlab/lefsim"
+homepage = "https://abdenlab.github.io/lefsim/"
+
+[workspace.dependencies]
+lefsim = { path = "crates/lefsim" }
+slotmap = "1"
+smallvec = "1"
+rand = { version = "0.8", default-features = false }
+rand_pcg = { version = "0.3", default-features = false }
+libm = "0.2"
+bytemuck = { version = "1", features = ["derive", "extern_crate_alloc"] }
+serde = { version = "1", default-features = false, features = ["derive", "std"] }
+serde_json = "1"
+
+# Used by `pnpm build:wasm`, so wasm tuning doesn't affect native release
+# builds (e.g. the Python extension). Measured: opt-level 3 was both the
+# fastest (4.8 M events/s vs 3.3 M for "z") and the smallest gzipped
+# (36.7 KB vs 37.7 KB for "z"), so there's no size/speed trade-off to make.
+[profile.wasm-release]
+inherits = "release"
+lto = true
+codegen-units = 1
+opt-level = 3

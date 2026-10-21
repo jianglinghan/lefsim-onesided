@@ -1,0 +1,29 @@
+[package]
+name = "lefsim"
+description = "Stochastic, event-driven simulation of loop-extrusion factors on a 1D lattice"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/lefsim"
+readme = "README.md"
+keywords = ["loop-extrusion", "chromatin", "simulation", "gillespie", "biology"]
+categories = ["science", "simulation"]
+
+[dependencies]
+slotmap.workspace = true
+smallvec.workspace = true
+rand.workspace = true
+rand_pcg.workspace = true
+libm.workspace = true
+bytemuck.workspace = true
+serde = { workspace = true, optional = true }
+
+[features]
+# Serialize/Deserialize for the model types (Model, World, Lattice, Rates,
+# LefStates, ...). Validated types load through their constructors.
+serde = ["dep:serde"]
+
+[dev-dependencies]
+serde_json.workspace = true
