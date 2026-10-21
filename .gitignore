@@ -1,7 +1,0 @@
-target/
-node_modules/
-.venv/
-dist/
-__pycache__/
-packages/lefsim/wasm/
-packages/demo/public/sample.parquet
