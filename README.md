@@ -1,0 +1,149 @@
+# lefsim
+
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23481501.svg)](https://doi.org/10.5281/zenodo.23481501)
+
+> **One-sided fork.** This repository adds one-sided (asymmetric) loop
+> extrusion to upstream [lefsim](https://github.com/abdenlab/lefsim): a LEF
+> anchors one leg while the other extrudes, and a CTCF capture from its
+> capture side switches the roles (the hitting leg anchors, the partner takes
+> over). A new `Extrusion` leg-rule (`two_sided` default / `one_sided`) runs
+> through the Rust core, both bindings and the explorer demo, which gains an
+> "Extrusion" mode switch and a third (gray) color for anchored legs. The
+> kymograph's row scroll also scrolls by whole device pixels, fixing smear
+> trails on non-integer `devicePixelRatio` displays. Two-sided seeded runs
+> are bit-identical to upstream.
+
+Action-based stochastic simulation of loop-extrusion factors (LEFs) on a 1D
+lattice.
+
+LEFs bind chromatin, extrude loops by walking two legs outward, and are stopped
+or turned back by CTCF boundary elements, depending on their orientation. lefsim
+simulates this exactly and event by event, with a Rust core and bindings for
+Python and the browser. A seed gives the same run, bit for bit, in all three.
+
+- **Rust**: the `lefsim` crate (`crates/lefsim`).
+- **Python**: the `lefsim` package (`python/`, built from `crates/lefsim-py`
+    with pyo3 and maturin). Results come back as Arrow data, for pyarrow,
+    polars, pandas and duckdb.
+- **Browser**: the `lefsim` TypeScript package (`packages/lefsim`, wrapping the
+    WebAssembly build in `crates/lefsim-wasm`), with the explorer app in
+    `packages/demo`, live at <https://lefsim.abdenlab.org>.
+
+## Documentation
+
+The documentation lives in [`docs/`](docs/index.md): getting started, the model,
+recording and replay, effective distance, a guide per language and the Python
+API reference. Preview it as a site with [Zensical](https://zensical.org),
+configured in `zensical.toml`, without installing anything:
+
+```
+make docs-serve    # uvx --with mkdocstrings-python zensical serve
+```
+
+## A quick look
+
+```python
+import lefsim
+import polars as pl
+
+lattice = lefsim.Lattice(1000, {"site": [300, 700], "captures_from": ["right", "left"], "strength": 0.9})
+model = lefsim.Model(lefsim.populate(lattice, 10, seed=1), lefsim.Rates())
+sim = lefsim.Sim(model, seed=42)
+
+rec = sim.record_until(1000.0, dt=1.0, events=True)
+pl.DataFrame(rec.snapshots)  # time, lef_id, left_pos, right_pos, left/right_mobility
+pl.DataFrame(rec.events)  # one row per leg changed by each event
+```
+
+The same in [Rust and TypeScript](docs/getting-started.md#a-first-run).
+
+## Development
+
+```
+cargo test                                   # the core
+cargo run --example single_lef               # a single LEF's trajectory
+
+cd python                                    # the Python package
+uv sync                                      # venv, dependencies and the extension
+uv run pytest tests                          # rebuilds first if the Rust code changed
+
+pnpm install                                 # the TypeScript package and demos
+pnpm build:wasm                              # wasm-pack → packages/lefsim/wasm
+pnpm test                                    # vitest, against the real wasm build
+pnpm demo                                    # the demos, on a Vite dev server
+```
+
+## Layout
+
+```
+Cargo.toml              workspace
+crates/lefsim/          core crate
+  src/model/            the model (never depends on sim/):
+    mod.rs                Model = World + Rates + SpawnRule
+    world.rs              World: the state (lattice + legs and LEFs), LefStates
+    lattice.rs, entity.rs sites and CTCFs; legs, LEFs and their keys
+    action.rs             Action, Rates, scheduling and firing rules, CTCF landing
+    spawn.rs              Spawn, SpawnRule, populate
+    distance.rs           LoopGraph: effective distance
+  src/sim/              running and observing a model:
+    mod.rs                Sim, its constructors, batch drivers
+    record.rs             Recorder, EventRecorder, frames
+    replay.rs             Replayer
+    engine.rs, heap.rs    event loop and indexed heap (internal)
+  examples/single_lef.rs
+  tests/
+crates/lefsim-py/       Python bindings (pyo3): Sim, Batch, Stream; Arrow conversion
+python/                 the Python package built from them (maturin)
+  lefsim/               package, type stubs
+  tests/                pytest suite
+  notebooks/            a tour of the package (not shipped in the sdist)
+crates/lefsim-wasm/     WebAssembly bindings (wasm-bindgen)
+packages/lefsim/        TypeScript package wrapping them (wasm-pack builds into wasm/)
+packages/demo/          the explorer app (Svelte, Vite)
+docs/                   documentation (Zensical, configured in zensical.toml)
+scripts/                release helpers: bump and check the version
+.github/workflows/      CI, docs deployment, releases
+```
+
+## Releasing
+
+The `lefsim` crate, the Python wheel and the npm package share one version and
+are released together. While it's 0.x, bump the minor version for any breaking
+API change in any language *or any change to seeded trajectories* (a new golden
+hash), and the patch version for anything else.
+
+1. On `main`, with CI green, set the version and start its changelog section:
+
+    ```
+    scripts/bump-version.sh 0.2.0
+    ```
+
+    This updates `Cargo.toml` (which the wheel reads too),
+    `packages/lefsim/package.json` and `Cargo.lock`, and turns the "Unreleased"
+    section of `CHANGELOG.md` into a `0.2.0` section.
+
+1. Review `CHANGELOG.md`, then commit, tag and push:
+
+    ```
+    git commit -am "Release 0.2.0"
+    git tag v0.2.0
+    git push origin main v0.2.0
+    ```
+
+The tag starts `.github/workflows/release.yml`, which:
+
+- checks that the tag matches the version, and runs the full CI suite;
+- builds the wheels (Linux, musllinux, macOS and Windows, x86_64 and arm64, each
+    tested on its own platform where a runner exists), the sdist and the npm
+    tarball;
+- once all of that passes, publishes to crates.io, PyPI and npm in parallel;
+- creates a GitHub release with the changelog section and the built files.
+
+A version with a pre-release suffix (`0.2.0-rc.1`) is published as a
+pre-release: PyPI gets `0.2.0rc1`, and npm gets the `next` dist-tag, so
+`npm install lefsim` still installs the latest stable version.
+
+Each publish job skips a registry that already has the version, so if one fails,
+fix the cause and re-run the workflow. A registry never accepts the same version
+twice, so never move a tag that reached any registry: bump to the next patch
+version instead.
