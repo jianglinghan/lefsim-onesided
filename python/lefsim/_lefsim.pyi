@@ -158,6 +158,8 @@ class Rates:
         respawn: Optional[float] = None,
         respawn_blocked: Optional[float] = None,
         respawn_captured: Optional[float] = None,
+        ctcf_on: Optional[float] = None,
+        ctcf_off: Optional[float] = None,
     ) -> None: ...
     @property
     def step(self) -> float:
@@ -172,6 +174,12 @@ class Rates:
     @property
     def respawn_captured(self) -> float:
         """Respawn rate of a LEF with a captured leg, whatever the other leg does."""
+    @property
+    def ctcf_on(self) -> Optional[float]:
+        """CTCF binding rate, if dynamic CTCF occupancy is enabled."""
+    @property
+    def ctcf_off(self) -> Optional[float]:
+        """CTCF unbinding rate (drop-off), if dynamic CTCF occupancy is enabled."""
     def to_dict(self) -> Any:
         """As plain Python data (dicts, lists, numbers and strings), in the same
         shape as the JSON.
