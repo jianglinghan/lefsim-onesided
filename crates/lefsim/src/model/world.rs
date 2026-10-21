@@ -195,7 +195,7 @@ pub type OccupancyBucket = SmallVec<[LegKey; 2]>;
 /// positions; read through the accessors.
 ///
 /// Two worlds are equal when their lattices and [`LefStates`] are equal,
-/// whatever their internal keys.
+/// whatever their internal keys (and CTCF occupancy state).
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(
@@ -213,6 +213,12 @@ pub struct World {
     pub(crate) lef_order: Vec<LefKey>,
     /// `occupancy[i]` lists the leg(s) currently sitting at site `i`.
     pub(crate) occupancy: Vec<OccupancyBucket>,
+    /// CTCF occupancy under dynamic rates ([`crate::Rates::ctcf_on`]):
+    /// `ctcf_bound[i]` is whether the CTCF at site `i` is bound. Internal
+    /// dynamic state, like the slotmap keys: not part of `PartialEq` and not
+    /// recorded; recordings capture its only observable effect, a released
+    /// leg's changed mobility.
+    pub(crate) ctcf_bound: Vec<bool>,
 }
 
 impl PartialEq for World {
@@ -231,6 +237,7 @@ impl World {
             lefs: SlotMap::with_key(),
             lef_order: Vec::new(),
             occupancy: vec![OccupancyBucket::new(); n],
+            ctcf_bound: vec![false; n],
         }
     }
 
@@ -381,6 +388,17 @@ impl World {
     /// `true` iff some leg currently sits at `p`.
     pub fn occupied(&self, p: Position) -> bool {
         !self.occupancy[p as usize].is_empty()
+    }
+
+    /// Whether the CTCF at `p` is bound, under dynamic CTCF rates. Plain
+    /// sites and unbound CTCFs read `false`; with static rates (`ctcf_on` is
+    /// `None`) this stays all-false and `strength` semantics apply instead.
+    pub fn ctcf_bound(&self, p: Position) -> bool {
+        self.ctcf_bound[p as usize]
+    }
+
+    pub(crate) fn set_ctcf_bound(&mut self, p: Position, bound: bool) {
+        self.ctcf_bound[p as usize] = bound;
     }
 
     pub fn legs_at(&self, p: Position) -> &[LegKey] {

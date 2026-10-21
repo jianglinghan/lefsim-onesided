@@ -17,7 +17,7 @@ export const DIRECTION = ["Left", "Right"] as const;
 export const SITE_KIND = ["Plain", "Ctcf"] as const;
 
 /** Row-kind names, indexed by the codes in a {@link DeltaChunk}'s `kind`. */
-export const ROW_KIND = ["Step", "Respawn", "Keyframe", "Evict"] as const;
+export const ROW_KIND = ["Step", "Respawn", "Keyframe", "Evict", "CtcfBind", "CtcfRelease"] as const;
 
 /** The `kind` code of keyframe rows. */
 export const KEYFRAME = 2;
@@ -64,6 +64,12 @@ export interface LiveState {
   leftMobility: Uint8Array;
   /** Each LEF's right leg mobility, as {@link MOBILITY} codes. */
   rightMobility: Uint8Array;
+  /**
+   * CTCF occupancy (1 bound, 0 unbound), one entry per CTCF in the
+   * lattice's CTCF order. Only present with dynamic CTCF rates; the arrays
+   * are views into WebAssembly memory, like the leg columns.
+   */
+  ctcfBound?: Uint8Array;
 }
 
 /**
@@ -113,6 +119,19 @@ export interface Rates {
   respawnBlocked: number;
   /** Respawn rate of a LEF with a captured leg, whatever the other leg does. */
   respawnCaptured: number;
+  /**
+   * CTCF binding rate. Set both this and `ctcfOff` to switch CTCFs to
+   * explicit occupancy dynamics: a bound CTCF certainly captures and
+   * evicts, an unbound one does neither (CTCF `strength` is then
+   * ignored), and the initial occupancy is drawn from equilibrium.
+   * Leave undefined for the static `strength` semantics.
+   */
+  ctcfOn?: number;
+  /**
+   * CTCF unbinding rate ("drop-off"): a bound CTCF unbinds at this rate
+   * and releases any captured leg. Requires `ctcfOn`.
+   */
+  ctcfOff?: number;
 }
 
 /** The built-in spawn rules: where a LEF lands when it (re)spawns. */
@@ -149,6 +168,12 @@ export interface Lefs {
   leftMobility: Uint8Array;
   /** Each LEF's right leg mobility, as {@link MOBILITY} codes. */
   rightMobility: Uint8Array;
+  /**
+   * CTCF occupancy (1 bound, 0 unbound), one entry per CTCF in the
+   * lattice's CTCF order. Only present with dynamic CTCF rates; the arrays
+   * are views into WebAssembly memory, like the leg columns.
+   */
+  ctcfBound?: Uint8Array;
 }
 
 /** The state of a simulation at one moment. Create with `createWorld` or `populate`. */

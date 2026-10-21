@@ -241,7 +241,14 @@ def test_model_json_round_trip_and_shape():
     assert doc["format"] == "lefsim.model" and doc["version"] == 2
     assert doc["lattice"]["n_sites"] == 200
     assert doc["lattice"]["ctcfs"][0] == {"site": 60, "captures_from": "right", "strength": 0.8}
-    assert doc["rates"] == {"step": 1.0, "respawn": 0.02, "respawn_blocked": 0.02, "respawn_captured": 0.005}
+    assert doc["rates"] == {
+        "step": 1.0,
+        "respawn": 0.02,
+        "respawn_blocked": 0.02,
+        "respawn_captured": 0.005,
+        "ctcf_on": None,
+        "ctcf_off": None,
+    }
     assert doc["spawn"] == {"rule": "uniform_non_ctcf"}
     rows = table(model.world.to_arrow()).drop_columns(["lef_id"]).to_pylist()
     assert doc["lefs"] == [{k: v.lower() if isinstance(v, str) else v for k, v in r.items()} for r in rows]
@@ -853,7 +860,14 @@ def test_stream_argument_errors(kwargs, match):
 
 def test_action_dictionary_includes_keyframe():
     ev = pa.record_batch(make_sim().record_until(10.0, events=True).events)
-    assert ev["action"].dictionary.to_pylist() == ["Step", "Respawn", "Keyframe", "Evict"]
+    assert ev["action"].dictionary.to_pylist() == [
+        "Step",
+        "Respawn",
+        "Keyframe",
+        "Evict",
+        "CtcfBind",
+        "CtcfRelease",
+    ]
 
 
 def test_keyframed_events_open_with_every_leg():

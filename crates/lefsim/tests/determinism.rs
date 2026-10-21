@@ -31,7 +31,9 @@ fn fingerprint() -> u64 {
         respawn: 0.01,
         respawn_blocked: 0.05,
         respawn_captured: 0.002,
-    };
+        ctcf_on: None,
+    ctcf_off: None,
+};
     let mut sim = Sim::new(Model::new(world, rates, rule).unwrap(), 0x5EED);
     let mut rec = sim.recorder(SampleMode::every_dt(5.0));
     let mut ev = EventRecorder::new();

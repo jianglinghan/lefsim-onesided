@@ -302,6 +302,8 @@ export function modelArgs(m: Model) {
     r.respawn,
     r.respawnBlocked,
     r.respawnCaptured,
+    r.ctcfOn ?? null,
+    r.ctcfOff ?? null,
     m.spawnRule,
     m.spawnWeight ?? null,
   ] as const;
@@ -371,6 +373,8 @@ export function modelToJson(model: Model, indent?: number | string): string {
       respawn: model.rates.respawn,
       respawn_blocked: model.rates.respawnBlocked,
       respawn_captured: model.rates.respawnCaptured,
+      ctcf_on: model.rates.ctcfOn ?? null,
+      ctcf_off: model.rates.ctcfOff ?? null,
     },
     spawn: { rule: model.spawnRule },
   };
@@ -414,6 +418,8 @@ export function modelFromJson(text: string): Model {
     respawn: field<number>(r, "respawn", "rates"),
     respawnBlocked: field<number>(r, "respawn_blocked", "rates"),
     respawnCaptured: field<number>(r, "respawn_captured", "rates"),
+    ctcfOn: (r as { ctcf_on?: number | null }).ctcf_on ?? undefined,
+    ctcfOff: (r as { ctcf_off?: number | null }).ctcf_off ?? undefined,
   };
   const spawnRule = field<SpawnRule>(field<object>(doc, "spawn", "model"), "rule", "spawn");
   if (spawnRule === "weighted_sites") {

@@ -477,6 +477,9 @@ impl PySim {
             Action::Step { leg } => (t, "Step", sim.leg_id(leg).expect("own leg")),
             Action::Respawn { lef } => (t, "Respawn", sim.lef_id(lef).expect("own lef")),
             Action::Evict { leg } => (t, "Evict", sim.leg_id(leg).expect("own leg")),
+            // No leg: the CTCF's site stands in as the id.
+            Action::CtcfBind { site } => (t, "CtcfBind", site),
+            Action::CtcfRelease { site } => (t, "CtcfRelease", site),
         }))
     }
 

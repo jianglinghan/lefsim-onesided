@@ -16,7 +16,7 @@
 //! `leg_id = 2 * lef_id + side` where side 0 is the left-facing leg and side
 //! 1 the right-facing one. Slotmap keys stay internal.
 
-mod engine;
+pub(crate) mod engine;
 mod heap;
 pub mod record;
 mod replay;
@@ -186,8 +186,9 @@ impl Sim {
         }
 
         let mut rng = SimRng::seed_from_u64(seed);
+        let mut world = world;
         let mut engine = Engine::new(rates, extrusion, start_time);
-        engine.initialize(&world, &mut rng);
+        engine.initialize(&mut world, &mut rng);
         Sim {
             initial_world: world.clone(),
             seed,
@@ -547,7 +548,7 @@ mod tests {
 
         let mut rng = SimRng::seed_from_u64(seed);
         let mut engine = Engine::new(Rates::default(), Extrusion::TwoSided, 0.0);
-        engine.initialize(&world, &mut rng);
+        engine.initialize(&mut world, &mut rng);
         let mut touched = Touched::default();
 
         for _ in 0..5000 {

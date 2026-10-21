@@ -39,7 +39,9 @@ fn lef_extrudes_outward_on_empty_lattice() {
             respawn_blocked: 1e-9,
 
             respawn_captured: 1e-9,
-        },
+            ctcf_on: None,
+    ctcf_off: None,
+},
         7,
     );
 
@@ -73,7 +75,9 @@ fn right_facing_leg_captured_at_compatible_ctcf() {
             respawn_blocked: 1e-12,
 
             respawn_captured: 1e-12,
-        },
+            ctcf_on: None,
+    ctcf_off: None,
+},
         11,
     );
 
@@ -102,7 +106,9 @@ fn an_unprotected_eviction_unloads_the_lef_in_one_event() {
         respawn: 1e-12,
         respawn_blocked: 1e-12,
         respawn_captured: 1e-12,
-    };
+        ctcf_on: None,
+    ctcf_off: None,
+};
     let mut sim = one_lef(Lattice::new(sites).unwrap(), 10, rates, 13);
     loop {
         let (_, action) = sim
@@ -145,7 +151,9 @@ fn a_fresh_lefs_right_leg_moves_on_when_the_leg_ahead_leaves() {
             respawn: 1e-12,
             respawn_blocked: 1e-12,
             respawn_captured: 1e-12,
-        };
+            ctcf_on: None,
+    ctcf_off: None,
+};
         let mut sim = Sim::new(
             Model::new(world, rates, SpawnRule::UniformNonCtcf).unwrap(),
             seed,

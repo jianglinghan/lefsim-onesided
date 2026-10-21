@@ -353,7 +353,14 @@ impl EventFrames {
     /// Row-kind names, indexed by the codes in the `kind` column: the
     /// [`Action`] variants, by [`Action::code`], and `Keyframe`, which isn't
     /// an action. (`Evict` came after `Keyframe`, so it's last.)
-    pub const KIND_NAMES: [&str; 4] = ["Step", "Respawn", "Keyframe", "Evict"];
+    pub const KIND_NAMES: [&str; 6] = [
+    "Step",
+    "Respawn",
+    "Keyframe",
+    "Evict",
+    "CtcfBind",
+    "CtcfRelease",
+];
 
     /// The `kind` code of keyframe rows.
     pub const KEYFRAME: u8 = 2;
@@ -447,6 +454,13 @@ impl EventFrames {
             Action::Evict { leg } => {
                 let lef = sim.world().legs[leg].lef;
                 sim.world().lefs[lef].legs.map(Some)
+            }
+            // Binding changes no legs.
+            Action::CtcfBind { .. } => [None, None],
+            // Unbinding releases captured legs: record their new state.
+            Action::CtcfRelease { site } => {
+                let occ = sim.world().legs_at(site);
+                [occ.first().copied(), occ.get(1).copied()]
             }
         };
         for leg in legs.into_iter().flatten() {

@@ -54,6 +54,14 @@
     if (input.value.trim() !== "" && Number.isFinite(v) && v > 0) run.setRates({ [key]: v });
     else input.value = String(run.rates[key]);
   }
+
+  /** The dynamic-CTCF rates: empty or 0 disables them (rebuild resets the input). */
+  function setCtcfRate(key: "ctcfOn" | "ctcfOff", input: HTMLInputElement) {
+    const v = Number(input.value);
+    if (input.value.trim() !== "" && Number.isFinite(v) && v > 0) run.setRates({ [key]: v });
+    else run.setRates({ [key]: 0 });
+    input.value = String(run.rates[key] ?? "");
+  }
 </script>
 
 <!-- Model files can be dropped anywhere on the shelf. -->
@@ -289,20 +297,25 @@
         <option value="one_sided" selected={run.extrusion === "one_sided"}>One-sided</option>
       </select>
     </label>
-    <label
-      class="row"
-      title="Load loop extruders preferentially at NIPBL-rich sites (50x the background), spread evenly across the lattice. Resets the run."
-    >
-      <span>NIPBL loading</span>
+    <label class="row" title="How much likelier each loading site is than a background site (50 = the cr139 0.05/0.001 ratio). Applies on rebuild.">
+      <span>Loading weight</span>
+      <output class="mono">{run.loadingBoost}×</output>
       <input
-        type="checkbox"
-        checked={run.nipbl}
-        onchange={(e) => {
-          run.nipbl = e.currentTarget.checked;
-          run.restart();
-        }}
+        type="range"
+        min="1"
+        max="200"
+        step="1"
+        value={run.loadingBoost}
+        oninput={(e) => run.setLoadingBoost(Number(e.currentTarget.value))}
+        aria-label="Loading weight: how much likelier a loading site is than a background site"
       />
     </label>
+    <div class="row" title="Loading sites are the red lane under the CTCF lanes: click it to add one, drag to move, drag out to remove.">
+      <span>Loading sites</span>
+      <output class="mono">{run.loadings.length}</output>
+      <button class="btn" onclick={() => run.addLoadingEvenly()}>Add</button>
+      <button class="btn" onclick={() => run.removeLastLoading()} disabled={!run.loadings.length}>Remove</button>
+    </div>
     <h3>Rates</h3>
     <div class="rates">
       {#each RATE_FIELDS as f (f.key)}
@@ -320,6 +333,35 @@
     </div>
     <p class="hint">
       Rates are events per time unit.
+    </p>
+    <div class="rates">
+      <label for="rate-ctcf-on">CTCF bind (kon)</label>
+      <input
+        id="rate-ctcf-on"
+        class="mono"
+        type="number"
+        min="0"
+        step="any"
+        placeholder="off"
+        value={run.rates.ctcfOn ?? ""}
+        onchange={(e) => setCtcfRate("ctcfOn", e.currentTarget)}
+      />
+      <label for="rate-ctcf-off">CTCF off (koff)</label>
+      <input
+        id="rate-ctcf-off"
+        class="mono"
+        type="number"
+        min="0"
+        step="any"
+        placeholder="off"
+        value={run.rates.ctcfOff ?? ""}
+        onchange={(e) => setCtcfRate("ctcfOff", e.currentTarget)}
+      />
+    </div>
+    <p class="hint">
+      Set both to give CTCFs dynamic occupancy: a bound CTCF (bright chevron) always captures and
+      evicts; an unbound one (faint) does nothing. CTCF off releases held legs. Empty = static
+      strength semantics.
     </p>
   </section>
 

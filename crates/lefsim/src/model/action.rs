@@ -26,6 +26,19 @@ pub struct Rates {
     /// is doing: capture protects a LEF from faster unloading, and its other
     /// leg from eviction.
     pub respawn_captured: f64,
+    /// CTCF binding rate: how fast an unbound CTCF site binds. `Some` (with
+    /// `ctcf_off`) switches CTCFs to explicit occupancy dynamics: a bound
+    /// CTCF certainly captures from its capture side and certainly evicts
+    /// from its evict side, an unbound one does neither, and `strength` is
+    /// ignored. `None` (default) keeps the static per-encounter `strength`
+    /// semantics. Initial occupancy at sim start is drawn from the
+    /// equilibrium `kon / (kon + koff)`.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub ctcf_on: Option<f64>,
+    /// CTCF unbinding rate ("drop-off"): a bound CTCF unbinds after a wait at
+    /// this rate and releases any captured leg. See [`Rates::ctcf_on`].
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub ctcf_off: Option<f64>,
 }
 
 impl Default for Rates {
@@ -38,6 +51,8 @@ impl Default for Rates {
             respawn: 1e-3,
             respawn_blocked: 1e-2,
             respawn_captured: 1e-3,
+            ctcf_on: None,
+            ctcf_off: None,
         }
     }
 }
@@ -76,6 +91,14 @@ pub enum Action {
     /// `p = 1` if a captured leg holds it. A leg whose partner is captured is
     /// immune: it passes a bare CTCF at the full rate, and a held one blocks it.
     Evict { leg: LegKey },
+    /// A CTCF site binds (dynamic CTCF rates only, see [`Rates::ctcf_on`]):
+    /// from then on it certainly captures legs landing on its capture side
+    /// and certainly evicts legs meeting its evict side, until it unbinds.
+    CtcfBind { site: Position },
+    /// A bound CTCF unbinds ("drops off") at [`Rates::ctcf_off`], and any leg
+    /// it holds is released. One-sided anchored legs are not CTCF holds:
+    /// they stay anchored.
+    CtcfRelease { site: Position },
 }
 
 impl Action {
@@ -87,6 +110,8 @@ impl Action {
             Action::Step { .. } => 0,
             Action::Respawn { .. } => 1,
             Action::Evict { .. } => 3,
+            Action::CtcfBind { .. } => 4,
+            Action::CtcfRelease { .. } => 5,
         }
     }
 
@@ -97,6 +122,8 @@ impl Action {
             Action::Step { leg } => schedule_step(leg, world, rates, now, rng),
             Action::Respawn { lef } => schedule_respawn(lef, world, rates, now, rng),
             Action::Evict { leg } => schedule_evict(leg, world, rates, now, rng),
+            Action::CtcfBind { site } => schedule_ctcf_bind(site, world, rates, now, rng),
+            Action::CtcfRelease { site } => schedule_ctcf_release(site, world, rates, now, rng),
         }
     }
 
@@ -107,15 +134,18 @@ impl Action {
         &self,
         world: &mut World,
         spawn: &dyn Spawn,
+        rates: &Rates,
         extrusion: Extrusion,
         _now: Time,
         rng: &mut SimRng,
         touched: &mut Touched,
     ) {
         match *self {
-            Action::Step { leg } => fire_step(leg, world, extrusion, rng, touched),
+            Action::Step { leg } => fire_step(leg, world, rates, extrusion, rng, touched),
             Action::Respawn { lef } => fire_respawn(lef, world, spawn, extrusion, rng, touched),
             Action::Evict { leg } => fire_evict(leg, world, spawn, extrusion, rng, touched),
+            Action::CtcfBind { site } => fire_ctcf_bind(site, world, touched),
+            Action::CtcfRelease { site } => fire_ctcf_release(site, world, touched),
         }
     }
 }
@@ -180,19 +210,27 @@ enum Ahead {
     Free,
     /// An empty CTCF met from behind (its capture side faces away from the
     /// leg), with this strength, the chance it's bound: the leg passes onto
-    /// it or is evicted by it, competing.
+    /// it or is evicted by it, competing. Static rates only.
     CtcfBack(f64),
     /// A CTCF met from behind and holding a captured leg: bound for certain,
     /// so the leg can only be evicted.
     CtcfBackHeld,
+    /// A bound CTCF met from behind under dynamic rates: eviction is certain
+    /// while it stays bound.
+    CtcfBackBound,
     /// Any other leg, or the lattice's end: the leg can't step.
     Blocked,
+}
+
+/// Whether CTCF occupancy is dynamic ([`Rates::ctcf_on`] set).
+fn dynamic_ctcfs(rates: &Rates) -> bool {
+    rates.ctcf_on.is_some()
 }
 
 /// What's ahead of `leg_k`. A leg captured on a CTCF always faces back
 /// toward the CTCF's other side, so a captured leg ahead on a CTCF met from
 /// behind is exactly a held CTCF; any other leg ahead is traffic.
-fn ahead(world: &World, leg_k: LegKey) -> Ahead {
+fn ahead(world: &World, rates: &Rates, leg_k: LegKey) -> Ahead {
     let leg = &world.legs[leg_k];
     let Some(target) = leg
         .facing
@@ -210,6 +248,18 @@ fn ahead(world: &World, leg_k: LegKey) -> Ahead {
     };
     let occupants = world.legs_at(target);
     match back {
+        Some(_) if dynamic_ctcfs(rates) => {
+            if occupants
+                .iter()
+                .any(|&o| world.legs[o].mobility == Mobility::Captured)
+            {
+                Ahead::CtcfBackHeld
+            } else if world.ctcf_bound(target) {
+                Ahead::CtcfBackBound
+            } else {
+                Ahead::Free
+            }
+        }
         Some(strength) if occupants.is_empty() => Ahead::CtcfBack(strength),
         Some(_)
             if occupants
@@ -235,11 +285,11 @@ fn protected(world: &World, leg_k: LegKey) -> bool {
 /// ahead, or the lattice's end; for a protected leg, also a held CTCF met
 /// from behind). Derived from positions, never stored, so it can't go stale
 /// as neighbors move.
-fn blocked(world: &World, leg_k: LegKey) -> bool {
+fn blocked(world: &World, rates: &Rates, leg_k: LegKey) -> bool {
     world.legs[leg_k].mobility == Mobility::Moving
-        && match ahead(world, leg_k) {
+        && match ahead(world, rates, leg_k) {
             Ahead::Blocked => true,
-            Ahead::CtcfBackHeld => protected(world, leg_k),
+            Ahead::CtcfBackHeld | Ahead::CtcfBackBound => protected(world, leg_k),
             Ahead::Free | Ahead::CtcfBack(_) => false,
         }
 }
@@ -263,13 +313,13 @@ fn schedule_step(
     if world.legs[leg_k].mobility != Mobility::Moving {
         return Schedule::Never;
     }
-    match ahead(world, leg_k) {
+    match ahead(world, rates, leg_k) {
         Ahead::Free => at_rate(rates.step, now, rng),
         // Immune to eviction: it just steps on.
         Ahead::CtcfBack(_) if protected(world, leg_k) => at_rate(rates.step, now, rng),
         // Passing: the CTCF turns out unbound.
         Ahead::CtcfBack(strength) => at_rate((1.0 - strength) * rates.step, now, rng),
-        Ahead::CtcfBackHeld | Ahead::Blocked => Schedule::Never,
+        Ahead::CtcfBackHeld | Ahead::CtcfBackBound | Ahead::Blocked => Schedule::Never,
     }
 }
 
@@ -283,12 +333,38 @@ fn schedule_evict(
     if world.legs[leg_k].mobility != Mobility::Moving || protected(world, leg_k) {
         return Schedule::Never;
     }
-    match ahead(world, leg_k) {
+    match ahead(world, rates, leg_k) {
         // The CTCF turns out bound...
         Ahead::CtcfBack(strength) => at_rate(strength * rates.step, now, rng),
         // ...or is, for certain.
-        Ahead::CtcfBackHeld => at_rate(rates.step, now, rng),
+        Ahead::CtcfBackHeld | Ahead::CtcfBackBound => at_rate(rates.step, now, rng),
         Ahead::Free | Ahead::Blocked => Schedule::Never,
+    }
+}
+
+fn schedule_ctcf_bind(
+    site: Position,
+    world: &World,
+    rates: &Rates,
+    now: Time,
+    rng: &mut SimRng,
+) -> Schedule {
+    match (rates.ctcf_on, world.ctcf_bound(site)) {
+        (Some(kon), false) => at_rate(kon, now, rng),
+        _ => Schedule::Never,
+    }
+}
+
+fn schedule_ctcf_release(
+    site: Position,
+    world: &World,
+    rates: &Rates,
+    now: Time,
+    rng: &mut SimRng,
+) -> Schedule {
+    match (rates.ctcf_off, world.ctcf_bound(site)) {
+        (Some(koff), true) => at_rate(koff, now, rng),
+        _ => Schedule::Never,
     }
 }
 
@@ -312,7 +388,7 @@ fn respawn_rate(lef_k: LefKey, world: &World, rates: &Rates) -> f64 {
         .any(|&l| world.legs[l].mobility == Mobility::Captured)
     {
         rates.respawn_captured
-    } else if legs.iter().any(|&l| blocked(world, l)) {
+    } else if legs.iter().any(|&l| blocked(world, rates, l)) {
         rates.respawn_blocked
     } else {
         rates.respawn
@@ -324,6 +400,7 @@ fn respawn_rate(lef_k: LefKey, world: &World, rates: &Rates) -> f64 {
 fn fire_step(
     leg_k: LegKey,
     world: &mut World,
+    rates: &Rates,
     extrusion: Extrusion,
     rng: &mut SimRng,
     touched: &mut Touched,
@@ -359,10 +436,24 @@ fn fire_step(
     world.insert_leg(leg_k, new_pos);
     let kind = world.lattice.sites[new_pos as usize].kind;
     let arrived_from = facing.opposite();
+    // Decide the landing before borrowing the leg mutably.
+    let captured_on_landing = dynamic_ctcfs(rates)
+        && matches!(kind, SiteKind::Ctcf { captures_from, .. } if arrived_from == captures_from)
+        && world.ctcf_bound(new_pos);
     let (mobility, switched) = {
         let leg = &mut world.legs[leg_k];
         leg.pos = new_pos;
-        leg.mobility = resolve_mobility(kind, arrived_from, rng);
+        leg.mobility = if dynamic_ctcfs(rates) {
+            // Occupancy is explicit: a bound CTCF captures from its capture
+            // side, an unbound one passes legs through.
+            if captured_on_landing {
+                Mobility::Captured
+            } else {
+                Mobility::Moving
+            }
+        } else {
+            resolve_mobility(kind, arrived_from, rng)
+        };
         // One-sided: a capture anchors the leg at the CTCF and hands
         // extrusion to the partner, rather than holding the leg there.
         let switched =
@@ -395,6 +486,53 @@ fn fire_step(
             .chain(post_neighbors)
             .filter(|&n| n != leg_k),
     );
+}
+
+/// Neighbors of `site` whose clocks depend on the CTCF there: a leg directly
+/// on either side, facing it (its step/eviction clocks flip with occupancy).
+fn touch_ctcf_neighbors(site: Position, world: &World, touched: &mut Touched) {
+    for n in world.legs_at(site) {
+        touched.legs.push(*n);
+    }
+    for d in [Direction::Left, Direction::Right] {
+        if let Some(p) = d.shift(site)
+            && (p as usize) < world.lattice.len()
+        {
+            for &n in world.legs_at(p) {
+                touched.legs.push(n);
+            }
+        }
+    }
+}
+
+/// A CTCF binds: legs meeting it now face a bound barrier.
+fn fire_ctcf_bind(site: Position, world: &mut World, touched: &mut Touched) {
+    world.set_ctcf_bound(site, true);
+    touch_ctcf_neighbors(site, world, touched);
+}
+
+/// A CTCF unbinds: any captured leg it holds is released (one-sided anchored
+/// legs are not holds and stay anchored), and legs meeting it now pass.
+fn fire_ctcf_release(site: Position, world: &mut World, touched: &mut Touched) {
+    world.set_ctcf_bound(site, false);
+    let occupants: SmallVec<[LegKey; 2]> = world.legs_at(site).to_vec().into();
+    for leg in occupants {
+        if world.legs[leg].mobility != Mobility::Captured {
+            continue;
+        }
+        world.legs[leg].mobility = Mobility::Moving;
+        touched.legs.push(leg);
+        let lef = world.legs[leg].lef;
+        touched.lefs.push(lef);
+        // The partner's eviction immunity came from this capture.
+        let partner = world.lefs[lef]
+            .legs
+            .into_iter()
+            .find(|&l| l != leg)
+            .expect("a leg has a partner");
+        touched.legs.push(partner);
+    }
+    touch_ctcf_neighbors(site, world, touched);
 }
 
 /// Eviction: the LEF unloads at once, respawning in the same event, so no
@@ -600,6 +738,8 @@ mod tests {
         respawn: 1.0,
         respawn_blocked: 2.0,
         respawn_captured: 3.0,
+        ctcf_on: None,
+        ctcf_off: None,
     };
 
     /// A LEF as `((left_pos, mobility), (right_pos, mobility))`.
@@ -723,7 +863,7 @@ mod tests {
             world_with(&[((25, Moving), (27, Moving)), ((26, Moving), (26, Moving))]);
         let behind = world.lefs[keys[1]].legs[0];
         assert_eq!(clocks(&world, behind), (false, false));
-        assert!(blocked(&world, behind));
+        assert!(blocked(&world, &RATES, behind));
         // A leg at the lattice's end: neither.
         let (world, keys) = world_with(&[((30, Moving), (39, Moving))]);
         assert_eq!(clocks(&world, world.lefs[keys[0]].legs[1]), (false, false));
@@ -762,7 +902,7 @@ mod tests {
         ]);
         let leg = world.lefs[keys[1]].legs[0];
         assert_eq!(clocks(&world, leg), (false, false));
-        assert!(blocked(&world, leg));
+        assert!(blocked(&world, &RATES, leg));
     }
 
     #[test]
@@ -775,6 +915,7 @@ mod tests {
         fire_step(
             right,
             &mut world,
+            &RATES,
             Extrusion::TwoSided,
             &mut SimRng::seed_from_u64(0),
             &mut touched,
@@ -850,6 +991,7 @@ mod tests {
         fire_step(
             leg,
             &mut world,
+            &RATES,
             Extrusion::TwoSided,
             &mut rng,
             &mut Touched::default(),
@@ -984,6 +1126,7 @@ mod tests {
         fire_step(
             right,
             &mut world,
+            &RATES,
             Extrusion::OneSided,
             &mut SimRng::seed_from_u64(0),
             &mut touched,
@@ -1011,6 +1154,7 @@ mod tests {
         fire_step(
             right,
             &mut world,
+            &RATES,
             Extrusion::OneSided,
             &mut SimRng::seed_from_u64(0),
             &mut Touched::default(),
@@ -1032,11 +1176,142 @@ mod tests {
         let anchored = world.lefs[keys[0]].legs[0];
         // No step, no eviction, and not "blocked": passive, not stuck.
         assert_eq!(clocks(&world, anchored), (false, false));
-        assert!(!blocked(&world, anchored));
+        assert!(!blocked(&world, &RATES, anchored));
         // No capture protection: the LEF unloads at the basal rate.
         assert_eq!(respawn_rate(keys[0], &world, &RATES), RATES.respawn);
         // The anchored leg still occupies its site as traffic.
         assert!(world.occupied(5));
+    }
+
+    // ----- dynamic CTCFs (kon/koff occupancy) -----
+
+    /// Rates with dynamic CTCFs: fast binding, slow unbinding.
+    const DYN_RATES: Rates = Rates {
+        step: 1.0,
+        respawn: 1.0,
+        respawn_blocked: 2.0,
+        respawn_captured: 3.0,
+        ctcf_on: Some(1.0),
+        ctcf_off: Some(0.01),
+    };
+
+    #[test]
+    fn dynamic_bound_ctcf_captures_and_unbound_passes() {
+        use Mobility::Captured;
+        // The right leg at 24 steps onto the CTCF at 25 (strength 0: with
+        // static rates this would certainly pass).
+        let (mut world, keys) = world_on(lattice(0.0), &[((21, Moving), (24, Moving))]);
+        let [_, right] = world.lefs[keys[0]].legs;
+
+        // Unbound: passes through, no capture roll.
+        world.set_ctcf_bound(25, false);
+        fire_step(
+            right,
+            &mut world,
+            &DYN_RATES,
+            Extrusion::TwoSided,
+            &mut SimRng::seed_from_u64(0),
+            &mut Touched::default(),
+        );
+        assert_eq!(
+            (world.legs[right].pos, world.legs[right].mobility),
+            (25, Mobility::Moving)
+        );
+
+        // Bound: captured for certain, even at strength 0.
+        let (mut world, keys) = world_on(lattice(0.0), &[((21, Moving), (24, Moving))]);
+        let [_, right] = world.lefs[keys[0]].legs;
+        world.set_ctcf_bound(25, true);
+        fire_step(
+            right,
+            &mut world,
+            &DYN_RATES,
+            Extrusion::TwoSided,
+            &mut SimRng::seed_from_u64(0),
+            &mut Touched::default(),
+        );
+        assert_eq!(world.legs[right].mobility, Captured);
+    }
+
+    #[test]
+    fn dynamic_eviction_is_certain_while_bound() {
+        // The left leg at 26 faces the CTCF at 25 from behind: with the CTCF
+        // bound, only eviction is scheduled; unbound, only the step.
+        let dyn_clocks = |world: &World, leg: LegKey| {
+            let scheduled = |action: Action| {
+                matches!(
+                    action.schedule(world, &DYN_RATES, 0.0, &mut SimRng::seed_from_u64(0)),
+                    Schedule::At(_)
+                )
+            };
+            (
+                scheduled(Action::Step { leg }),
+                scheduled(Action::Evict { leg }),
+            )
+        };
+        let (world, keys) = world_with(&[((26, Moving), (30, Moving))]);
+        let leg = world.lefs[keys[0]].legs[0];
+        let mut bound = world.clone();
+        bound.set_ctcf_bound(25, true);
+        assert_eq!(dyn_clocks(&bound, leg), (false, true));
+        let mut unbound = world;
+        unbound.set_ctcf_bound(25, false);
+        assert_eq!(dyn_clocks(&unbound, leg), (true, false));
+    }
+
+    #[test]
+    fn releasing_a_ctcf_frees_its_captured_leg() {
+        use Mobility::Captured;
+        let (mut world, _) = world_with(&[((21, Moving), (25, Captured))]);
+        let right = world.lefs[world.lef_order[0]].legs[1];
+        let left = world.lefs[world.lef_order[0]].legs[0];
+        world.set_ctcf_bound(25, true);
+        let mut touched = Touched::default();
+        fire_ctcf_release(25, &mut world, &mut touched);
+        assert!(!world.ctcf_bound(25));
+        assert_eq!(world.legs[right].mobility, Mobility::Moving);
+        assert!(touched.legs.contains(&left), "the partner's clocks changed");
+        // A one-sided anchored leg on the CTCF is not a hold: it stays.
+        let (mut world, keys) = world_with(&[((21, Moving), (25, Mobility::Anchored))]);
+        world.set_ctcf_bound(25, true);
+        fire_ctcf_release(25, &mut world, &mut Touched::default());
+        assert_eq!(world.legs[world.lefs[keys[0]].legs[1]].mobility, Mobility::Anchored);
+    }
+
+    #[test]
+    fn ctcf_bind_and_release_reschedule_each_other() {
+        let mut world = World::new(lattice(1.0));
+        world.set_ctcf_bound(20, false);
+        let mut rng = SimRng::seed_from_u64(0);
+        let bind = Action::CtcfBind { site: 20 }.schedule(&world, &DYN_RATES, 0.0, &mut rng);
+        let release = Action::CtcfRelease { site: 20 }.schedule(&world, &DYN_RATES, 0.0, &mut rng);
+        assert!(matches!(bind, Schedule::At(_)), "unbound CTCF binds at kon");
+        assert!(matches!(release, Schedule::Never), "unbound CTCF has no off clock");
+        world.set_ctcf_bound(20, true);
+        let mut rng = SimRng::seed_from_u64(0);
+        let bind = Action::CtcfBind { site: 20 }.schedule(&world, &DYN_RATES, 0.0, &mut rng);
+        let release = Action::CtcfRelease { site: 20 }.schedule(&world, &DYN_RATES, 0.0, &mut rng);
+        assert!(matches!(bind, Schedule::Never));
+        assert!(matches!(release, Schedule::At(_)), "bound CTCF unbinds at koff");
+    }
+
+    #[test]
+    fn engine_draws_initial_occupancy_from_equilibrium() {
+        use crate::model::{Rates, Site};
+        use crate::sim::engine::Engine;
+        // kon >> koff: essentially every CTCF starts bound.
+        let rates = Rates {
+            ctcf_on: Some(1e6),
+            ctcf_off: Some(1.0),
+            ..Rates::default()
+        };
+        let mut sites = vec![Site::plain(); 50];
+        sites[10] = Site::ctcf(Direction::Left, 0.5);
+        sites[40] = Site::ctcf(Direction::Right, 0.5);
+        let mut world = World::new(Lattice::new(sites).unwrap());
+        let mut engine = Engine::new(rates, Extrusion::TwoSided, 0.0);
+        engine.initialize(&mut world, &mut SimRng::seed_from_u64(3));
+        assert!(world.ctcf_bound(10) && world.ctcf_bound(40));
     }
 
     #[test]

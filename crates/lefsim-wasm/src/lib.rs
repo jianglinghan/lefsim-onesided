@@ -17,8 +17,8 @@
 use js_sys::{Float64Array, Object, Reflect, Uint8Array, Uint32Array};
 use lefsim::{
     Ctcf, Direction, EventFrames, EventRecorder, Extrusion, Lattice, LefFrames, LefStates,
-    LoopGraph, Mobility, Model, Rates, Recorder, RunReport, SampleMode, SpawnRule, StopReason,
-    World,
+    LoopGraph, Mobility, Model, Rates, Recorder, RunReport, SampleMode, SiteKind, SpawnRule,
+    StopReason, World,
 };
 use wasm_bindgen::prelude::*;
 
@@ -71,6 +71,9 @@ pub struct WasmSim {
     /// The world's LEF table as of the last `sync_state`. Refilled in place,
     /// so its buffers (and the views JS builds on them) don't move.
     state: LefStates,
+    /// CTCF occupancy as of the last `sync_state`, one byte per CTCF in the
+    /// lattice's CTCF order.
+    ctcf_bound: Vec<u8>,
     /// The most recent grid recorder, kept so that consecutive recording
     /// calls on the same grid continue it instead of repeating points.
     grid: Option<Recorder>,
@@ -248,6 +251,8 @@ fn model_from(
     respawn: f64,
     respawn_blocked: f64,
     respawn_captured: f64,
+    ctcf_on: Option<f64>,
+    ctcf_off: Option<f64>,
     rule: SpawnRule,
 ) -> Result<Model, JsError> {
     let lattice = lattice_from(n_sites, site, side, strength)?;
@@ -258,6 +263,8 @@ fn model_from(
         respawn,
         respawn_blocked,
         respawn_captured,
+        ctcf_on,
+        ctcf_off,
     };
     Model::new(world, rates, rule).map_err(js_err)
 }
@@ -312,6 +319,8 @@ pub fn check_model(
     respawn: f64,
     respawn_blocked: f64,
     respawn_captured: f64,
+    ctcf_on: Option<f64>,
+    ctcf_off: Option<f64>,
     spawn_rule: &str,
     spawn_weights: Option<Vec<f64>>,
 ) -> Result<(), JsError> {
@@ -328,6 +337,8 @@ pub fn check_model(
         respawn,
         respawn_blocked,
         respawn_captured,
+        ctcf_on,
+        ctcf_off,
         spawn_rule_from(spawn_rule, spawn_weights)?,
     )
     .map(|_| ())
@@ -367,6 +378,8 @@ fn rates_object(r: Rates) -> Object {
     set(&obj, "respawn", r.respawn);
     set(&obj, "respawnBlocked", r.respawn_blocked);
     set(&obj, "respawnCaptured", r.respawn_captured);
+    set(&obj, "ctcfOn", r.ctcf_on);
+    set(&obj, "ctcfOff", r.ctcf_off);
     obj
 }
 
@@ -402,6 +415,8 @@ impl WasmSim {
         respawn: f64,
         respawn_blocked: f64,
         respawn_captured: f64,
+        ctcf_on: Option<f64>,
+        ctcf_off: Option<f64>,
         spawn_rule: &str,
         spawn_weights: Option<Vec<f64>>,
         seed: u64,
@@ -430,13 +445,17 @@ impl WasmSim {
             respawn,
             respawn_blocked,
             respawn_captured,
+            ctcf_on,
+            ctcf_off,
             rule,
         )?;
         let sim = lefsim::Sim::with_extrusion_from(model, seed, extrusion, start_time);
         let state = sim.world().lef_states();
+        let ctcf_bound = ctcf_bound_column(&sim);
         Ok(WasmSim {
             sim,
             state,
+            ctcf_bound,
             grid: None,
         })
     }
@@ -701,12 +720,14 @@ impl WasmSim {
             Some((t, action)) => {
                 let id = match action {
                     lefsim::Action::Step { leg } | lefsim::Action::Evict { leg } => {
-                        self.sim.leg_id(leg)
+                        self.sim.leg_id(leg).map(JsValue::from)
                     }
-                    lefsim::Action::Respawn { lef } => self.sim.lef_id(lef),
-                }
-                .expect("the sim's own entity");
-                js_sys::Array::of3(&t.into(), &action.code().into(), &id.into()).into()
+                    lefsim::Action::Respawn { lef } => self.sim.lef_id(lef).map(JsValue::from),
+                    // CTCF actions have no leg: null id.
+                    lefsim::Action::CtcfBind { .. } | lefsim::Action::CtcfRelease { .. } => None,
+                };
+                let id = id.unwrap_or(JsValue::NULL);
+                js_sys::Array::of3(&t.into(), &action.code().into(), &id).into()
             }
         }
     }
@@ -716,6 +737,7 @@ impl WasmSim {
         WasmSim {
             sim: self.sim.clone(),
             state: self.state.clone(),
+            ctcf_bound: self.ctcf_bound.clone(),
             grid: self.grid.clone(),
         }
     }
@@ -727,6 +749,7 @@ impl WasmSim {
     pub fn sync_state(&mut self) {
         self.state.clear();
         self.sim.world().push_lef_states(&mut self.state);
+        self.ctcf_bound = ctcf_bound_column(&self.sim);
     }
 
     pub fn left_pos_ptr(&self) -> *const u32 {
@@ -744,6 +767,32 @@ impl WasmSim {
     pub fn right_mob_ptr(&self) -> *const u8 {
         Mobility::as_codes(&self.state.right_mobility).as_ptr()
     }
+
+    /// Number of CTCFs (the length of the `ctcf_bound` column).
+    pub fn n_ctcfs(&self) -> u32 {
+        self.ctcf_bound.len() as u32
+    }
+
+    /// CTCF occupancy codes (1 bound, 0 unbound), aligned with the lattice's
+    /// CTCF list. Valid until the next call into this sim.
+    pub fn ctcf_bound_ptr(&self) -> *const u8 {
+        self.ctcf_bound.as_ptr()
+    }
+}
+
+/// CTCF occupancy as a column, in site order (one byte per CTCF).
+fn ctcf_bound_column(sim: &lefsim::Sim) -> Vec<u8> {
+    let world = sim.world();
+    world
+        .lattice()
+        .sites()
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| match s.kind {
+            SiteKind::Ctcf { .. } => Some(u8::from(world.ctcf_bound(i as u32))),
+            _ => None,
+        })
+        .collect()
 }
 
 // ----- effective distance -----

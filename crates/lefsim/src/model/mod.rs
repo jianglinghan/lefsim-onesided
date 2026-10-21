@@ -110,6 +110,23 @@ pub(crate) fn check(world: &World, rates: &Rates, spawn: &dyn Spawn) -> Result<(
             return Err(ModelError::BadRate { name, value });
         }
     }
+    // Dynamic CTCFs come as a pair of positive rates.
+    match (rates.ctcf_on, rates.ctcf_off) {
+        (None, None) => {}
+        (Some(on), Some(off)) => {
+            for (name, value) in [("ctcf_on", on), ("ctcf_off", off)] {
+                if !(value.is_finite() && value > 0.0) {
+                    return Err(ModelError::BadRate { name, value });
+                }
+            }
+        }
+        _ => {
+            return Err(ModelError::BadRate {
+                name: "ctcf_on",
+                value: f64::NAN,
+            })
+        }
+    }
     spawn
         .check(world.lattice(), world.n_lefs())
         .map_err(ModelError::Spawn)

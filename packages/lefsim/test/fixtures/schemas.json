@@ -215,7 +215,9 @@
      "Step",
      "Respawn",
      "Keyframe",
-     "Evict"
+     "Evict",
+     "CtcfBind",
+     "CtcfRelease"
     ]
    }
   ]

@@ -168,7 +168,7 @@ export interface FiredEvent {
   /** When it fired. */
   time: number;
   /** Which action fired. */
-  action: "Step" | "Respawn" | "Evict";
+  action: "Step" | "Respawn" | "Evict" | "CtcfBind" | "CtcfRelease";
   /** The `leg_id` for a step or an eviction, the `lef_id` for a respawn. */
   id: number;
 }
@@ -538,6 +538,7 @@ export class Sim implements Disposable {
       rightPos: new Uint32Array(buf, sim.right_pos_ptr(), n),
       leftMobility: new Uint8Array(buf, sim.left_mob_ptr(), n),
       rightMobility: new Uint8Array(buf, sim.right_mob_ptr(), n),
+      ctcfBound: new Uint8Array(buf, sim.ctcf_bound_ptr(), sim.n_ctcfs()),
     };
   }
 

@@ -50,6 +50,7 @@ function palette() {
     extruding: v("--extruding"),
     held: v("--held"),
     anchored: v("--anchored"),
+    loading: v("--loading"),
     probe: v("--probe"),
   };
 }
@@ -129,6 +130,19 @@ export function setLattice(lattice: Lattice) {
 /** The lattice size the views are drawing. */
 export function nSites(): number {
   return geometry.nSites;
+}
+
+/** NIPBL loading sites, for tracks under every panel (0 or more sites). */
+let loadingSites: readonly number[] = [];
+
+/** Set the loading sites every view marks (call before drawing, and on change). */
+export function setLoadings(sites: readonly number[]): void {
+  loadingSites = sites;
+}
+
+/** The loading sites set by {@link setLoadings}. */
+export function loadings(): readonly number[] {
+  return loadingSites;
 }
 
 // ------------------------------------------------------------------ geometry
@@ -212,6 +226,8 @@ export interface Frame {
   held: Uint8Array;
   /** 1 if either leg of the LEF is anchored (the passive leg of a one-sided LEF). */
   anchored: Uint8Array;
+  /** CTCF occupancy (1 bound, 0 unbound), one entry per CTCF in lattice CTCF order. */
+  ctcfBound: Uint8Array;
 }
 
 /** Copy a LiveState (from a Sim or a Replayer) into a Frame. */
@@ -230,6 +246,7 @@ export function snapshotOf(state: LiveState): Frame {
     rightPos: state.rightPos.slice(),
     held,
     anchored,
+    ctcfBound: state.ctcfBound ? state.ctcfBound.slice() : new Uint8Array(),
   };
 }
 
@@ -399,6 +416,9 @@ export class Kymograph {
     // Faint TAD boundaries, so domains read in the kymograph too.
     ctx.fillStyle = colors.rule;
     for (const b of geometry.boundaries) ctx.fillRect(x(b), 0, 1, row);
+    // Loading sites, as thin red ticks.
+    ctx.fillStyle = colors.loading;
+    for (const s of loadingSites) ctx.fillRect(x(s), 0, 1, row);
     under?.(ctx, x);
 
     const style = (i: number) =>

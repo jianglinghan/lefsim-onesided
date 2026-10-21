@@ -24,7 +24,7 @@ import {
   Sim,
 } from "lefsim";
 
-import { type Frame, setLattice, snapshotOf } from "../render.ts";
+import { type Frame, setLattice, setLoadings, snapshotOf } from "../render.ts";
 
 export const DEFAULT_N_SITES = 3000;
 export const MIN_SITES = 100;
@@ -115,8 +115,10 @@ export class Run {
   seed = $state(DEFAULT_PRESET.seed);
   /** The extrusion leg-rule: two-sided, or one-sided with anchored legs. */
   extrusion = $state<Extrusion>("two_sided");
-  /** NIPBL-preferential loading: hot sites (50x) on a uniform background. */
-  nipbl = $state(false);
+  /** NIPBL loading sites: LEFs load here `loadingBoost` times more than the background. */
+  loadings = $state<number[]>([]);
+  /** How much likelier a loading site is than a background site (0.05/0.001 = 50 in the cr139 model). */
+  loadingBoost = $state(50);
   rates = $state<Rates>({ ...DEFAULT_RATES });
   ctcfs = $state<Ctcf[]>(defaultCtcfs(DEFAULT_N_SITES, DEFAULT_STRENGTH));
   /** One strength for every CTCF (`strength`), or each its own. */
@@ -180,16 +182,20 @@ export class Run {
     );
   }
 
-  /** Per-site loading weights for NIPBL-preferential loading, or undefined. */
+  /** Per-site loading weights from the loading sites, or undefined when none. */
   #spawnWeight(): Float64Array | undefined {
-    if (!this.nipbl) return undefined;
-    // Five hot sites evenly across the lattice, 50x the background of 1
-    // (the 0.05 vs 0.001 rate ratio of the cr139 orig model).
+    if (!this.loadings.length) return undefined;
     const w = new Float64Array(this.nSites).fill(1);
-    for (const f of [1 / 6, 2 / 6, 3 / 6, 4 / 6, 5 / 6]) {
-      w[Math.round(f * (this.nSites - 1))] = 50;
-    }
+    for (const site of this.loadings) w[site] = this.loadingBoost;
     return w;
+  }
+
+  /** How often a loading site wins a loading, for the readout. */
+  get loadingShare(): number {
+    if (!this.loadings.length) return 0;
+    const boost = this.loadingBoost;
+    const p = this.loadings.length * boost / (this.nSites - this.ctcfs.length + this.loadings.length * (boost - 1));
+    return p;
   }
 
   /** A new run: the LEFs placed afresh with the seed, on the current model. */
@@ -222,6 +228,7 @@ export class Run {
     this.#rebuilds = 0;
     this.sim = new Sim(model, { seed: this.seed, extrusion: this.extrusion });
     setLattice(model.world.lattice);
+    setLoadings(this.loadings);
     this.#rateWindow = [];
     this.#nextSample = this.sim.time + (this.#driver?.sampleDt ?? 0);
     this.revision++;
@@ -235,6 +242,7 @@ export class Run {
    * if a CTCF that can hold it is still at its site.
    */
   rebuild() {
+    setLoadings(this.loadings);
     const old = this.sim;
     if (!old) return;
     // Copy the state first: the next call into wasm can detach its views.
@@ -363,10 +371,19 @@ export class Run {
     this.rebuild();
   }
 
-  /** Set the rates; a value that isn't positive and finite is ignored. */
+  /**
+   * Set the rates; a value that isn't positive and finite is ignored. The
+   * dynamic-CTCF rates are the exception: 0 or empty disables them (back to
+   * static `strength` semantics).
+   */
   setRates(rates: Partial<Rates>) {
     for (const [k, v] of Object.entries(rates) as [keyof Rates, number][]) {
-      if (Number.isFinite(v) && v > 0) this.rates[k] = v;
+      if (k === "ctcfOn" || k === "ctcfOff") {
+        if (Number.isFinite(v) && v > 0) this.rates[k] = v;
+        else delete this.rates[k];
+      } else if (Number.isFinite(v) && v > 0) {
+        this.rates[k] = v;
+      }
     }
     this.rebuild();
   }
@@ -395,6 +412,62 @@ export class Run {
     this.rebuild();
   }
 
+  // ----- loading sites -----
+
+  /** Add a loading site at `site`; false if one is there or a CTCF owns the site. */
+  addLoading(site: number): boolean {
+    site = Math.max(1, Math.min(this.nSites - 2, Math.round(site)));
+    if (this.loadings.includes(site)) return false;
+    if (this.ctcfs.some((c) => c.site === site)) return false;
+    this.loadings.push(site);
+    this.rebuild();
+    return true;
+  }
+
+  /** Add a loading site in the middle of the widest stretch without one, so repeated adds spread evenly. False if no room. */
+  addLoadingEvenly(): boolean {
+    const sorted = [...this.loadings].sort((a, b) => a - b);
+    const edges = [-1, ...sorted, this.nSites];
+    let best = -1;
+    for (let k = 0; k < edges.length - 1; k++) {
+      const gap = edges[k + 1]! - edges[k]!;
+      if (gap >= 2 && (best < 0 || gap > edges[best + 1]! - edges[best]!)) best = k;
+    }
+    if (best < 0) return false;
+    return this.addLoading(Math.floor((edges[best]! + edges[best + 1]!) / 2));
+  }
+
+  /** Remove the most recently added loading site. */
+  removeLastLoading() {
+    if (this.loadings.length) {
+      this.loadings.pop();
+      this.rebuild();
+    }
+  }
+
+  /** Move loading site `i` to `site`; false if another element is there. */
+  moveLoading(i: number, site: number): boolean {
+    site = Math.max(1, Math.min(this.nSites - 2, Math.round(site)));
+    if (this.loadings[i] === site) return true;
+    if (this.loadings.includes(site) || this.ctcfs.some((c) => c.site === site)) return false;
+    this.loadings[i] = site;
+    this.rebuild();
+    return true;
+  }
+
+  removeLoading(i: number) {
+    this.loadings.splice(i, 1);
+    this.rebuild();
+  }
+
+  /** The loading boost; a non-positive or non-finite value is ignored. */
+  setLoadingBoost(v: number) {
+    if (Number.isFinite(v) && v > 0) {
+      this.loadingBoost = v;
+      this.rebuild();
+    }
+  }
+
   /** A new lattice size: the default layout at that size, with LEFs at the default density, run afresh. */
   resize(nSites: number) {
     const n = Math.max(MIN_SITES, Math.min(MAX_SITES, Math.round(nSites)));
@@ -403,6 +476,7 @@ export class Run {
     this.strengthLocked = true;
     for (const c of this.ctcfs) c.strength = this.strength;
     this.nLefs = Math.max(1, Math.round(n * LEFS_PER_SITE));
+    this.loadings = [];
     this.loaded = undefined;
     this.restart();
   }
@@ -417,6 +491,7 @@ export class Run {
     this.rates = { ...preset.rates };
     this.seed = preset.seed;
     this.speedLog = Math.log10(Math.max(1, preset.speed));
+    this.loadings = [];
     this.loaded = undefined;
     this.restart();
   }

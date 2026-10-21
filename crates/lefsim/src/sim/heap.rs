@@ -70,6 +70,10 @@ pub(super) struct IndexedHeap {
     respawn_pos: SecondaryMap<LefKey, usize>,
     /// Heap index of `Action::Evict { leg }`.
     evict_pos: SecondaryMap<LegKey, usize>,
+    /// Heap indexes of the CTCF actions, by site: `[bind, release]`.
+    /// `usize::MAX` marks an action not in the heap (never true mid-run:
+    /// every action is inserted in `Engine::initialize`).
+    ctcf_pos: Vec<[usize; 2]>,
 }
 
 impl IndexedHeap {
@@ -79,7 +83,13 @@ impl IndexedHeap {
             step_pos: SecondaryMap::new(),
             respawn_pos: SecondaryMap::new(),
             evict_pos: SecondaryMap::new(),
+            ctcf_pos: Vec::new(),
         }
+    }
+
+    /// Size the CTCF action lookup for a lattice of `n_sites` sites.
+    pub fn with_sites(&mut self, n_sites: usize) {
+        self.ctcf_pos = vec![[usize::MAX; 2]; n_sites];
     }
 
     pub fn with_capacity(cap: usize) -> Self {
@@ -88,6 +98,7 @@ impl IndexedHeap {
             step_pos: SecondaryMap::with_capacity(cap),
             respawn_pos: SecondaryMap::with_capacity(cap),
             evict_pos: SecondaryMap::with_capacity(cap),
+            ctcf_pos: Vec::new(),
         }
     }
 
@@ -140,6 +151,14 @@ impl IndexedHeap {
             Action::Step { leg } => self.step_pos.get(leg).copied(),
             Action::Respawn { lef } => self.respawn_pos.get(lef).copied(),
             Action::Evict { leg } => self.evict_pos.get(leg).copied(),
+            Action::CtcfBind { site } => match self.ctcf_pos[site as usize][0] {
+                usize::MAX => None,
+                i => Some(i),
+            },
+            Action::CtcfRelease { site } => match self.ctcf_pos[site as usize][1] {
+                usize::MAX => None,
+                i => Some(i),
+            },
         }
     }
 
@@ -153,6 +172,12 @@ impl IndexedHeap {
             }
             Action::Evict { leg } => {
                 self.evict_pos.insert(leg, idx);
+            }
+            Action::CtcfBind { site } => {
+                self.ctcf_pos[site as usize][0] = idx;
+            }
+            Action::CtcfRelease { site } => {
+                self.ctcf_pos[site as usize][1] = idx;
             }
         }
     }

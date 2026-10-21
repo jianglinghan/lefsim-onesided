@@ -66,6 +66,7 @@ pub fn parse_rule(s: &str) -> PyResult<SpawnRule> {
 pub fn rule_name(rule: SpawnRule) -> &'static str {
     match rule {
         SpawnRule::UniformNonCtcf => "uniform_non_ctcf",
+        SpawnRule::WeightedSites { .. } => "weighted_sites",
     }
 }
 
@@ -555,12 +556,14 @@ pub struct PyRates(pub lefsim::Rates);
 #[pymethods]
 impl PyRates {
     #[new]
-    #[pyo3(signature = (step = None, respawn = None, respawn_blocked = None, respawn_captured = None))]
+    #[pyo3(signature = (step = None, respawn = None, respawn_blocked = None, respawn_captured = None, ctcf_on = None, ctcf_off = None))]
     fn new(
         step: Option<f64>,
         respawn: Option<f64>,
         respawn_blocked: Option<f64>,
         respawn_captured: Option<f64>,
+        ctcf_on: Option<f64>,
+        ctcf_off: Option<f64>,
     ) -> Self {
         let d = lefsim::Rates::default();
         PyRates(lefsim::Rates {
@@ -568,6 +571,8 @@ impl PyRates {
             respawn: respawn.unwrap_or(d.respawn),
             respawn_blocked: respawn_blocked.unwrap_or(d.respawn_blocked),
             respawn_captured: respawn_captured.unwrap_or(d.respawn_captured),
+            ctcf_on: ctcf_on.or(d.ctcf_on),
+            ctcf_off: ctcf_off.or(d.ctcf_off),
         })
     }
 
@@ -594,6 +599,18 @@ impl PyRates {
     #[getter]
     fn respawn_captured(&self) -> f64 {
         self.0.respawn_captured
+    }
+
+    /// CTCF binding rate, if dynamic CTCF occupancy is enabled.
+    #[getter]
+    fn ctcf_on(&self) -> Option<f64> {
+        self.0.ctcf_on
+    }
+
+    /// CTCF unbinding rate (drop-off), if dynamic CTCF occupancy is enabled.
+    #[getter]
+    fn ctcf_off(&self) -> Option<f64> {
+        self.0.ctcf_off
     }
 
     /// As plain Python data (dicts, lists, numbers and strings), in the same

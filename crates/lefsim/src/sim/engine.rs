@@ -10,6 +10,8 @@
 
 use crate::model::action::{Action, Extrusion, Rates, Touched};
 use crate::model::{Schedule, SimRng, Spawn, Time, World};
+use crate::model::lattice::SiteKind;
+use rand::Rng;
 
 use super::heap::{IndexedHeap, Priority};
 
@@ -33,12 +35,22 @@ impl Engine {
         }
     }
 
-    /// Populate the heap with one entry per action in `world`. Call
-    /// once after constructing the engine. Subsequent rescheduling
-    /// updates entries in place.
-    pub(crate) fn initialize(&mut self, world: &World, rng: &mut SimRng) {
+    /// Populate the heap with one entry per action in `world`, and draw the
+    /// initial CTCF occupancy from the equilibrium `kon / (kon + koff)` when
+    /// dynamic CTCF rates are set. Call once after constructing the engine.
+    /// Subsequent rescheduling updates entries in place.
+    pub(crate) fn initialize(&mut self, world: &mut World, rng: &mut SimRng) {
         let total = 2 * world.legs.len() + world.lefs.len();
         self.heap = IndexedHeap::with_capacity(total);
+        self.heap.with_sites(world.lattice.len());
+        if let (Some(kon), Some(koff)) = (self.rates.ctcf_on, self.rates.ctcf_off) {
+            let p = kon / (kon + koff);
+            for site in 0..world.lattice.len() as u32 {
+                if matches!(world.lattice.sites[site as usize].kind, SiteKind::Ctcf { .. }) {
+                    world.set_ctcf_bound(site, rng.gen_bool(p));
+                }
+            }
+        }
         for k in world.legs.keys().collect::<Vec<_>>() {
             for action in [Action::Step { leg: k }, Action::Evict { leg: k }] {
                 let priority = match action.schedule(world, &self.rates, self.clock, rng) {
@@ -55,6 +67,21 @@ impl Engine {
                 Schedule::Never => Priority::NEVER,
             };
             self.heap.insert(action, priority);
+        }
+        for site in 0..world.lattice.len() as u32 {
+            if !matches!(world.lattice.sites[site as usize].kind, SiteKind::Ctcf { .. }) {
+                continue;
+            }
+            for action in [
+                Action::CtcfBind { site },
+                Action::CtcfRelease { site },
+            ] {
+                let priority = match action.schedule(world, &self.rates, self.clock, rng) {
+                    Schedule::At(t) => Priority(t),
+                    Schedule::Never => Priority::NEVER,
+                };
+                self.heap.insert(action, priority);
+            }
         }
     }
 
@@ -119,7 +146,7 @@ impl Engine {
         self.clock = time;
 
         touched.clear();
-        action.fire(world, spawn, self.extrusion, time, rng, touched);
+        action.fire(world, spawn, &self.rates, self.extrusion, time, rng, touched);
 
         // Reactive rescheduling: the fired action and everything it may have
         // invalidated, each once, as the model's dependency map names them.
@@ -147,7 +174,7 @@ mod tests {
         world.spawn_lef(40, &mut rng, Extrusion::TwoSided);
         world.spawn_lef(60, &mut rng, Extrusion::TwoSided);
         let mut engine = Engine::new(Rates::default(), Extrusion::TwoSided, 0.0);
-        engine.initialize(&world, &mut rng);
+        engine.initialize(&mut world, &mut rng);
 
         let mut touched = Touched::default();
         for _ in 0..2000 {
@@ -171,7 +198,7 @@ mod tests {
         let mut rng = SimRng::seed_from_u64(5);
         world.spawn_lef(25, &mut rng, Extrusion::TwoSided);
         let mut engine = Engine::new(Rates::default(), Extrusion::TwoSided, 0.0);
-        engine.initialize(&world, &mut rng);
+        engine.initialize(&mut world, &mut rng);
 
         let next = engine.next_event_time().unwrap();
         engine.advance_clock_to(next / 2.0);
