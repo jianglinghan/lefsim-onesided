@@ -27,13 +27,20 @@ pub trait Spawn {
 }
 
 /// The built-in spawn rules.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(tag = "rule", rename_all = "snake_case"))]
 pub enum SpawnRule {
     /// Uniform among `Plain` sites that no leg occupies.
     #[default]
     UniformNonCtcf,
+    /// Per-site loading weights: a LEF loads at a site with probability
+    /// proportional to its weight (high-weight sites are NIPBL-rich loading
+    /// preferences; weight 1 is the background). Sampling is rejection over
+    /// free plain sites, so a run never deadlocks; once every high-weight
+    /// site is taken, loading falls back to effectively uniform among the
+    /// free plain sites.
+    WeightedSites { weights: Vec<f64> },
 }
 
 impl Spawn for SpawnRule {
@@ -51,6 +58,33 @@ impl Spawn for SpawnRule {
                     }
                 }
             }
+            SpawnRule::WeightedSites { weights } => {
+                let n = world.lattice.len() as u32;
+                let max_w = weights.iter().copied().fold(0.0, f64::max);
+                // Cap the attempts so a lattice whose high-weight sites are
+                // all taken (or absent) falls back to uniform placement
+                // instead of spinning.
+                let cap = 100 * world.lattice.len() + 1;
+                for _ in 0..cap {
+                    let i = rng.gen_range(0..n);
+                    let kind = world.lattice.sites[i as usize].kind;
+                    if !matches!(kind, SiteKind::Plain) || world.occupied(i) {
+                        continue;
+                    }
+                    let w = weights.get(i as usize).copied().unwrap_or(0.0);
+                    if w > 0.0 && rng.gen_bool((w / max_w).min(1.0)) {
+                        return i;
+                    }
+                }
+                // Fallback: uniform among free plain sites.
+                loop {
+                    let i = rng.gen_range(0..n);
+                    let kind = world.lattice.sites[i as usize].kind;
+                    if matches!(kind, SiteKind::Plain) && !world.occupied(i) {
+                        return i;
+                    }
+                }
+            }
         }
     }
 
@@ -59,6 +93,20 @@ impl Spawn for SpawnRule {
             // The other n - 1 LEFs cover at most 2n - 2 sites, so 2n - 1
             // plain sites always leave one free.
             SpawnRule::UniformNonCtcf => {
+                let needed = (2 * n_lefs).saturating_sub(1);
+                let n_plain = lattice.n_plain();
+                if n_plain < needed {
+                    return Err(SpawnError::NotEnoughSites {
+                        n_lefs,
+                        needed,
+                        n_plain,
+                    });
+                }
+                Ok(())
+            }
+            // Same plain-site budget; concentration beyond it degrades to
+            // uniform loading rather than failing.
+            SpawnRule::WeightedSites { .. } => {
                 let needed = (2 * n_lefs).saturating_sub(1);
                 let n_plain = lattice.n_plain();
                 if n_plain < needed {
@@ -212,6 +260,91 @@ mod tests {
                 n_lefs: 3,
                 needed: 5,
                 n_plain: 3
+            })
+        );
+    }
+
+    #[test]
+    fn weighted_sites_sample_follows_weights() {
+        use rand::SeedableRng;
+        let n = 100;
+        let mut weights = vec![1.0; n];
+        weights[50] = 50.0; // a single NIPBL-rich hot site
+        let rule = SpawnRule::WeightedSites { weights };
+        // One LEF occupying site 0: 98 free plain sites at weight 1.
+        let mut world = World::new(Lattice::plain(n).unwrap());
+        world
+            .add_lef((0, Mobility::Moving), (0, Mobility::Moving))
+            .unwrap();
+        let mut rng = SimRng::seed_from_u64(11);
+        let trials = 20_000;
+        let mut hits = 0;
+        for _ in 0..trials {
+            if rule.sample(&world, &mut rng) == 50 {
+                hits += 1;
+            }
+        }
+        // Rejection sampling lands on a site with probability ∝ its weight:
+        // P(hot) = 50 / (98 * 1 + 50).
+        let p = 50.0 / 148.0;
+        let frac = hits as f64 / trials as f64;
+        let sigma = (p * (1.0 - p) / trials as f64).sqrt();
+        assert!(
+            (frac - p).abs() < 4.0 * sigma,
+            "hot-site fraction {frac}, want {p} (4σ {sigma:.4})"
+        );
+    }
+
+    #[test]
+    fn weighted_sites_reproduce_and_report_errors() {
+        let n = 1000;
+        let mut weights = vec![1.0; n];
+        for i in [100, 200, 300, 400, 500] {
+            weights[i] = 50.0;
+        }
+        let lattice = Lattice::plain(n).unwrap();
+        let rule = SpawnRule::WeightedSites { weights };
+        assert_eq!(rule.check(&lattice, 20), Ok(()));
+
+        let world = populate(lattice.clone(), 20, &rule, 7).expect("populated");
+        let again = populate(lattice.clone(), 20, &rule, 7).unwrap();
+        assert_eq!(again, world);
+
+        let tight = Lattice::plain(6).unwrap();
+        assert_eq!(
+            rule.check(&tight, 4),
+            Err(SpawnError::NotEnoughSites {
+                n_lefs: 4,
+                needed: 7,
+                n_plain: 6
+            })
+        );
+    }
+
+    #[test]
+    fn weighted_sites_fall_back_when_hot_sites_are_full() {
+        // One hot site, more LEFs than it can hold: the rest load elsewhere
+        // instead of deadlocking.
+        let n = 200;
+        let mut weights = vec![1.0; n];
+        weights[50] = 50.0;
+        let lattice = Lattice::plain(n).unwrap();
+        let rule = SpawnRule::WeightedSites { weights };
+        let world = populate(lattice, 20, &rule, 3).expect("populated");
+        assert_eq!(world.n_lefs(), 20);
+    }
+
+    #[test]
+    fn weighted_sites_check_needs_enough_plain_sites() {
+        let weights = vec![50.0; 6];
+        let lattice = Lattice::plain(6).unwrap();
+        let rule = SpawnRule::WeightedSites { weights };
+        assert_eq!(
+            rule.check(&lattice, 4),
+            Err(SpawnError::NotEnoughSites {
+                n_lefs: 4,
+                needed: 7,
+                n_plain: 6
             })
         );
     }

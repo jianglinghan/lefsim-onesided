@@ -252,11 +252,11 @@ impl Sim {
     /// recording came from: `Sim::with_start_time(initial, seed, start)`
     /// replays this run from its start, event for event.
     pub fn initial_model(&self) -> Option<Model> {
-        match self.spawn {
+        match &self.spawn {
             SpawnSource::BuiltIn(spawn) => Some(Model {
                 world: self.initial_world.clone(),
                 rates: self.rates(),
-                spawn,
+                spawn: spawn.clone(),
             }),
             SpawnSource::Custom(_) => None,
         }
@@ -280,11 +280,11 @@ impl Sim {
     /// continues from here with fresh randomness. To continue bit for bit,
     /// clone the sim instead.
     pub fn model(&self) -> Option<Model> {
-        match self.spawn {
+        match &self.spawn {
             SpawnSource::BuiltIn(spawn) => Some(Model {
                 world: self.world.clone(),
                 rates: self.rates(),
-                spawn,
+                spawn: spawn.clone(),
             }),
             SpawnSource::Custom(_) => None,
         }

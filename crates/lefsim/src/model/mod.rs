@@ -89,7 +89,7 @@ impl Model {
     }
 
     pub fn spawn(&self) -> SpawnRule {
-        self.spawn
+        self.spawn.clone()
     }
 
     /// The parts, by value.
@@ -169,13 +169,13 @@ mod tests {
     #[test]
     fn model_checks_rates_and_spawn_rule() {
         let rule = SpawnRule::UniformNonCtcf;
-        assert!(Model::new(world(10, 3), Rates::default(), rule).is_ok());
+        assert!(Model::new(world(10, 3), Rates::default(), rule.clone()).is_ok());
 
         let bad = Rates {
             respawn: f64::NAN,
             ..Rates::default()
         };
-        let err = Model::new(world(10, 3), bad, rule).unwrap_err();
+        let err = Model::new(world(10, 3), bad, rule.clone()).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -190,7 +190,7 @@ mod tests {
             step: 0.0,
             ..Rates::default()
         };
-        assert!(Model::new(world(10, 3), bad, rule).is_err());
+        assert!(Model::new(world(10, 3), bad, rule.clone()).is_err());
 
         // Three LEFs on four sites: add_lef accepts them, the rule can't
         // guarantee a free site at respawn.

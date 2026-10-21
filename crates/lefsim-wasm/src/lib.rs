@@ -199,6 +199,23 @@ fn extrusion_from(name: &str) -> Result<Extrusion, JsError> {
     }
 }
 
+/// The spawn rule, from its name plus an optional per-site weight column
+/// (which selects `weighted_sites`, e.g. NIPBL-preferential loading).
+fn spawn_rule_from(name: &str, weights: Option<Vec<f64>>) -> Result<SpawnRule, JsError> {
+    if let Some(w) = weights {
+        if w.iter().any(|x| !x.is_finite() || *x < 0.0) {
+            return Err(JsError::new("spawn weights must be non-negative and finite"));
+        }
+        return Ok(SpawnRule::WeightedSites { weights: w });
+    }
+    if name == "weighted_sites" {
+        return Err(JsError::new(
+            "spawn rule \"weighted_sites\" requires a per-site weight column",
+        ));
+    }
+    rule_from(name)
+}
+
 /// `{leftPos, rightPos, leftMobility, rightMobility}`, copied.
 fn lefs_object(lefs: &LefStates) -> Object {
     let out = Object::new();
@@ -231,7 +248,7 @@ fn model_from(
     respawn: f64,
     respawn_blocked: f64,
     respawn_captured: f64,
-    spawn_rule: &str,
+    rule: SpawnRule,
 ) -> Result<Model, JsError> {
     let lattice = lattice_from(n_sites, site, side, strength)?;
     let lefs = lefs_from(left_pos, right_pos, left_mob, right_mob)?;
@@ -242,7 +259,7 @@ fn model_from(
         respawn_blocked,
         respawn_captured,
     };
-    Model::new(world, rates, rule_from(spawn_rule)?).map_err(js_err)
+    Model::new(world, rates, rule).map_err(js_err)
 }
 
 // ----- validation and construction outside a sim -----
@@ -281,6 +298,7 @@ pub fn check_world(
 /// Throws unless the world, rates and spawn rule make a valid model.
 #[wasm_bindgen]
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn check_model(
     n_sites: u32,
     site: &[u32],
@@ -295,6 +313,7 @@ pub fn check_model(
     respawn_blocked: f64,
     respawn_captured: f64,
     spawn_rule: &str,
+    spawn_weights: Option<Vec<f64>>,
 ) -> Result<(), JsError> {
     model_from(
         n_sites,
@@ -309,7 +328,7 @@ pub fn check_model(
         respawn,
         respawn_blocked,
         respawn_captured,
-        spawn_rule,
+        spawn_rule_from(spawn_rule, spawn_weights)?,
     )
     .map(|_| ())
 }
@@ -327,16 +346,12 @@ pub fn populate(
     seed: u64,
     spawn_rule: &str,
     extrusion: &str,
+    spawn_weights: Option<Vec<f64>>,
 ) -> Result<Object, JsError> {
     let lattice = lattice_from(n_sites, site, side, strength)?;
-    let world = lefsim::populate_with(
-        lattice,
-        n_lefs as usize,
-        &rule_from(spawn_rule)?,
-        seed,
-        extrusion_from(extrusion)?,
-    )
-    .map_err(js_err)?;
+    let rule = spawn_rule_from(spawn_rule, spawn_weights)?;
+    let world = lefsim::populate_with(lattice, n_lefs as usize, &rule, seed, extrusion_from(extrusion)?)
+        .map_err(js_err)?;
     Ok(lefs_object(&world.lef_states()))
 }
 
@@ -388,6 +403,7 @@ impl WasmSim {
         respawn_blocked: f64,
         respawn_captured: f64,
         spawn_rule: &str,
+        spawn_weights: Option<Vec<f64>>,
         seed: u64,
         start_time: f64,
         extrusion: &str,
@@ -397,6 +413,10 @@ impl WasmSim {
                 "startTime must be finite, got {start_time}"
             )));
         }
+        let extrusion = extrusion_from(extrusion)?;
+        // The weighted rule rides in `spawn_weights` and becomes the model's
+        // own spawn rule, so respawns load preferentially too.
+        let rule = spawn_rule_from(spawn_rule, spawn_weights)?;
         let model = model_from(
             n_sites,
             site,
@@ -410,9 +430,8 @@ impl WasmSim {
             respawn,
             respawn_blocked,
             respawn_captured,
-            spawn_rule,
+            rule,
         )?;
-        let extrusion = extrusion_from(extrusion)?;
         let sim = lefsim::Sim::with_extrusion_from(model, seed, extrusion, start_time);
         let state = sim.world().lef_states();
         Ok(WasmSim {

@@ -289,6 +289,20 @@
         <option value="one_sided" selected={run.extrusion === "one_sided"}>One-sided</option>
       </select>
     </label>
+    <label
+      class="row"
+      title="Load loop extruders preferentially at NIPBL-rich sites (50x the background), spread evenly across the lattice. Resets the run."
+    >
+      <span>NIPBL loading</span>
+      <input
+        type="checkbox"
+        checked={run.nipbl}
+        onchange={(e) => {
+          run.nipbl = e.currentTarget.checked;
+          run.restart();
+        }}
+      />
+    </label>
     <h3>Rates</h3>
     <div class="rates">
       {#each RATE_FIELDS as f (f.key)}

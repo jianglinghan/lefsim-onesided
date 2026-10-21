@@ -116,7 +116,7 @@ export interface Rates {
 }
 
 /** The built-in spawn rules: where a LEF lands when it (re)spawns. */
-export type SpawnRule = "uniform_non_ctcf";
+export type SpawnRule = "uniform_non_ctcf" | "weighted_sites";
 
 /** A lattice's CTCFs as columns. `capturesFrom` holds {@link DIRECTION} codes. */
 export interface Ctcfs {
@@ -167,4 +167,10 @@ export interface Model {
   readonly rates: Rates;
   /** Where LEFs land when they respawn. */
   readonly spawnRule: SpawnRule;
+  /**
+   * Per-site loading weights for "weighted_sites" (NIPBL-preferential
+   * loading): one weight per lattice site, high at loading-rich sites.
+   * Undefined for uniform loading.
+   */
+  readonly spawnWeight?: Float64Array;
 }

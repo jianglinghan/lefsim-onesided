@@ -115,6 +115,8 @@ export class Run {
   seed = $state(DEFAULT_PRESET.seed);
   /** The extrusion leg-rule: two-sided, or one-sided with anchored legs. */
   extrusion = $state<Extrusion>("two_sided");
+  /** NIPBL-preferential loading: hot sites (50x) on a uniform background. */
+  nipbl = $state(false);
   rates = $state<Rates>({ ...DEFAULT_RATES });
   ctcfs = $state<Ctcf[]>(defaultCtcfs(DEFAULT_N_SITES, DEFAULT_STRENGTH));
   /** One strength for every CTCF (`strength`), or each its own. */
@@ -178,14 +180,32 @@ export class Run {
     );
   }
 
+  /** Per-site loading weights for NIPBL-preferential loading, or undefined. */
+  #spawnWeight(): Float64Array | undefined {
+    if (!this.nipbl) return undefined;
+    // Five hot sites evenly across the lattice, 50x the background of 1
+    // (the 0.05 vs 0.001 rate ratio of the cr139 orig model).
+    const w = new Float64Array(this.nSites).fill(1);
+    for (const f of [1 / 6, 2 / 6, 3 / 6, 4 / 6, 5 / 6]) {
+      w[Math.round(f * (this.nSites - 1))] = 50;
+    }
+    return w;
+  }
+
   /** A new run: the LEFs placed afresh with the seed, on the current model. */
   restart() {
     const lattice = this.lattice();
     this.nLefs = Math.min(Math.max(0, Math.round(this.nLefs)), this.maxLefs);
+    const spawnWeight = this.#spawnWeight();
     this.#start(
       createModel(
-        populate(lattice, this.nLefs, { seed: this.seed, extrusion: this.extrusion }),
+        populate(lattice, this.nLefs, {
+          seed: this.seed,
+          extrusion: this.extrusion,
+          spawnWeight,
+        }),
         { ...this.rates },
+        { spawnWeight },
       ),
     );
   }
@@ -253,7 +273,8 @@ export class Run {
 
     const lattice = this.lattice();
     const world = createWorld(lattice, { leftPos, rightPos, leftMobility, rightMobility });
-    this.sim = new Sim(createModel(world, { ...this.rates }), {
+    const spawnWeight = this.#spawnWeight();
+    this.sim = new Sim(createModel(world, { ...this.rates }, { spawnWeight }), {
       seed: this.seed + ++this.#rebuilds,
       startTime: time,
       extrusion: this.extrusion,

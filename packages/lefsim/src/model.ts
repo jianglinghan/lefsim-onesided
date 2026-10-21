@@ -83,7 +83,29 @@ export interface LefColumns {
 
 const U32_MAX = 2 ** 32 - 1;
 /** The built-in spawn rules, by name. */
-export const SPAWN_RULES: readonly SpawnRule[] = ["uniform_non_ctcf"];
+export const SPAWN_RULES: readonly SpawnRule[] = ["uniform_non_ctcf", "weighted_sites"];
+
+/** Per-site loading weights for {@link createModel} / {@link populate}. */
+export interface SpawnWeights {
+  /** One weight per lattice site: high at loading-rich sites (e.g. NIPBL), 1 as background. */
+  spawnWeight?: ArrayLike<number>;
+}
+
+function checkSpawnWeight(w: ArrayLike<number> | undefined, nSites: number): Float64Array | undefined {
+  if (w === undefined) return undefined;
+  if (w.length !== nSites) {
+    throw new RangeError(`spawnWeight must have one weight per site (${nSites}), got ${w.length}`);
+  }
+  const out = new Float64Array(nSites);
+  for (let i = 0; i < nSites; i++) {
+    const v = Number(w[i]);
+    if (!Number.isFinite(v) || v < 0) {
+      throw new RangeError(`spawnWeight must be non-negative and finite, got ${v} at site ${i}`);
+    }
+    out[i] = v;
+  }
+  return out;
+}
 /** The extrusion leg-rules, by name. */
 export const EXTRUSIONS: readonly Extrusion[] = ["two_sided", "one_sided"];
 
@@ -254,11 +276,17 @@ export function defaultRates(): Rates {
  * spawn rule. Checked by the core: rates positive and finite, and the
  * spawn rule able to place the world's LEFs.
  */
-export function createModel(world: World, rates: Partial<Rates> = {}, options: { spawnRule?: SpawnRule } = {}): Model {
+export function createModel(
+  world: World,
+  rates: Partial<Rates> = {},
+  options: { spawnRule?: SpawnRule } & SpawnWeights = {},
+): Model {
+  const spawnWeight = checkSpawnWeight(options.spawnWeight, world.lattice.nSites);
   const model: Model = {
     world,
     rates: { ...defaultRates(), ...rates },
-    spawnRule: checkSpawnRule(options.spawnRule ?? "uniform_non_ctcf"),
+    spawnRule: spawnWeight ? "weighted_sites" : checkSpawnRule(options.spawnRule ?? "uniform_non_ctcf"),
+    spawnWeight,
   };
   check_model(...modelArgs(model));
   return model;
@@ -275,6 +303,7 @@ export function modelArgs(m: Model) {
     r.respawnBlocked,
     r.respawnCaptured,
     m.spawnRule,
+    m.spawnWeight ?? null,
   ] as const;
 }
 
@@ -287,19 +316,21 @@ export function modelArgs(m: Model) {
 export function populate(
   lattice: Lattice,
   nLefs: number,
-  options: { seed?: number | bigint; spawnRule?: SpawnRule; extrusion?: Extrusion } = {},
+  options: { seed?: number | bigint; spawnRule?: SpawnRule; extrusion?: Extrusion } & SpawnWeights = {},
 ): World {
   if (!Number.isInteger(nLefs) || nLefs < 0 || nLefs > U32_MAX) {
     throw new RangeError(`nLefs must be a non-negative integer, got ${nLefs}`);
   }
-  const rule = checkSpawnRule(options.spawnRule ?? "uniform_non_ctcf");
   const extrusion = checkExtrusion(options.extrusion ?? "two_sided");
+  const spawnWeight = checkSpawnWeight(options.spawnWeight, lattice.nSites);
+  const rule = spawnWeight ? "weighted_sites" : checkSpawnRule(options.spawnRule ?? "uniform_non_ctcf");
   const lefs = wasmPopulate(
     ...latticeArgs(lattice),
     nLefs,
     seedBigInt(options.seed),
     rule,
     extrusion,
+    spawnWeight,
   ) as Lefs;
   return { lattice, lefs };
 }
@@ -385,5 +416,8 @@ export function modelFromJson(text: string): Model {
     respawnCaptured: field<number>(r, "respawn_captured", "rates"),
   };
   const spawnRule = field<SpawnRule>(field<object>(doc, "spawn", "model"), "rule", "spawn");
+  if (spawnRule === "weighted_sites") {
+    throw new RangeError("model JSON can't hold per-site loading weights; weighted_sites models can't be loaded from JSON");
+  }
   return createModel(world, rates, { spawnRule });
 }
