@@ -85,6 +85,13 @@ sites for n LEFs). Custom rules must implement the small `Spawn` trait. Unlike
 translocating legs, a spawned LEF landing on a CTCF may be captured there, but
 never evicted.
 
+`WeightedSpawn` is the preferential-loading variant (e.g. NIPBL): plain sites
+have weight 1 and each loading site a chosen ratio (50 reproduces the usual
+0.05-vs-0.001 preference), so draws cluster on the loading sites while the
+respawn *rate* is unchanged. It carries data, so it isn't a `SpawnRule`; a
+`Sim` takes it via `Sim::with_spawn_extrusion_from`, and the wasm/TS bindings
+take it as the `loading` option on `populate` and `new Sim`.
+
 ## Validity
 
 A world is checked as it's built, so it's always a state the dynamics could

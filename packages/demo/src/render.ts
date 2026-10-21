@@ -50,6 +50,7 @@ function palette() {
     extruding: v("--extruding"),
     held: v("--held"),
     anchored: v("--anchored"),
+    rnap: v("--rnap"),
     loading: v("--loading"),
     probe: v("--probe"),
   };
@@ -98,16 +99,18 @@ export function onThemeChange(redraw: () => void): () => void {
 interface Geometry {
   nSites: number;
   ctcfs: { site: number; left: boolean }[];
+  /** Pol II gene TSSs (a persistent track, independent of RNAP occupancy). */
+  genes: number[];
   /** TAD boundaries: one per cluster of neighboring CTCFs (e.g. a convergent pair). */
   boundaries: number[];
   /** Loop span drawn at full panel height: the largest TAD. */
   fullHeightSpan: number;
 }
 
-let geometry: Geometry = { nSites: 2, ctcfs: [], boundaries: [], fullHeightSpan: 1 };
+let geometry: Geometry = { nSites: 2, ctcfs: [], genes: [], boundaries: [], fullHeightSpan: 1 };
 
 /** Set the lattice every view draws (call before drawing, and on change). */
-export function setLattice(lattice: Lattice) {
+export function setLattice(lattice: Lattice, genes: readonly number[] = []) {
   const { site, capturesFrom } = lattice.ctcfs;
   const ctcfs = Array.from(site, (s, i) => ({ site: s, left: capturesFrom[i] === 0 })).sort((a, b) => a.site - b.site);
   // CTCFs within a couple of sites of each other form one boundary.
@@ -124,25 +127,18 @@ export function setLattice(lattice: Lattice) {
   close();
   const edges = [0, ...boundaries, lattice.nSites - 1];
   const largest = Math.max(...edges.slice(1).map((e, i) => e - edges[i]!));
-  geometry = { nSites: Math.max(2, lattice.nSites), ctcfs, boundaries, fullHeightSpan: Math.max(10, largest) };
+  geometry = {
+    nSites: Math.max(2, lattice.nSites),
+    ctcfs,
+    genes: [...genes].sort((a, b) => a - b),
+    boundaries,
+    fullHeightSpan: Math.max(10, largest),
+  };
 }
 
 /** The lattice size the views are drawing. */
 export function nSites(): number {
   return geometry.nSites;
-}
-
-/** NIPBL loading sites, for tracks under every panel (0 or more sites). */
-let loadingSites: readonly number[] = [];
-
-/** Set the loading sites every view marks (call before drawing, and on change). */
-export function setLoadings(sites: readonly number[]): void {
-  loadingSites = sites;
-}
-
-/** The loading sites set by {@link setLoadings}. */
-export function loadings(): readonly number[] {
-  return loadingSites;
 }
 
 // ------------------------------------------------------------------ geometry
@@ -202,6 +198,22 @@ export function drawCtcfs(ctx: CanvasRenderingContext2D, x: (site: number) => nu
   }
 }
 
+/** Stationary RNAPs as filled circles straddling the lattice line at `base`. */
+export function drawRnaps(
+  ctx: CanvasRenderingContext2D,
+  x: (site: number) => number,
+  base: number,
+  r: number,
+  rnaps: ArrayLike<number>,
+) {
+  ctx.fillStyle = colors.rnap;
+  for (let i = 0; i < rnaps.length; i++) {
+    ctx.beginPath();
+    ctx.arc(x(rnaps[i]!), base - 2, r, 0, 2 * Math.PI);
+    ctx.fill();
+  }
+}
+
 /** Place a tooltip next to the pointer, inside its container. */
 export function placeTooltip(tip: HTMLElement, canvas: HTMLCanvasElement, e: PointerEvent, text: string) {
   const rect = canvas.getBoundingClientRect();
@@ -226,12 +238,12 @@ export interface Frame {
   held: Uint8Array;
   /** 1 if either leg of the LEF is anchored (the passive leg of a one-sided LEF). */
   anchored: Uint8Array;
-  /** CTCF occupancy (1 bound, 0 unbound), one entry per CTCF in lattice CTCF order. */
-  ctcfBound: Uint8Array;
+  /** Sites of loaded RNAPs (live Pol II occupancy); empty without Pol II. */
+  rnaps: Uint32Array;
 }
 
-/** Copy a LiveState (from a Sim or a Replayer) into a Frame. */
-export function snapshotOf(state: LiveState): Frame {
+/** Copy a LiveState (from a Sim or a Replayer) and the RNAP sites into a Frame. */
+export function snapshotOf(state: LiveState, rnaps: Uint32Array = new Uint32Array(0)): Frame {
   const n = state.leftPos.length;
   const held = new Uint8Array(n);
   const anchored = new Uint8Array(n);
@@ -246,7 +258,7 @@ export function snapshotOf(state: LiveState): Frame {
     rightPos: state.rightPos.slice(),
     held,
     anchored,
-    ctcfBound: state.ctcfBound ? state.ctcfBound.slice() : new Uint8Array(),
+    rnaps: rnaps.slice(),
   };
 }
 
@@ -322,6 +334,34 @@ export class LoopView {
     ctx.stroke();
     drawCtcfs(ctx, x, base + 6, 10);
 
+    // Pol II gene track along the top edge: a rule with one marker per gene
+    // TSS — hollow while no RNAP sits there, filled while loaded.
+    if (geometry.genes.length) {
+      const gy = MARGIN.top + 8;
+      ctx.strokeStyle = colors.rule;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(x(0), gy + 0.5);
+      ctx.lineTo(x(geometry.nSites - 1), gy + 0.5);
+      ctx.stroke();
+      for (const g of geometry.genes) {
+        const gx = x(g);
+        const loaded = this.#frame?.rnaps.includes(g) ?? false;
+        ctx.beginPath();
+        ctx.moveTo(gx, gy - 4);
+        ctx.lineTo(gx - 3, gy + 1);
+        ctx.lineTo(gx + 3, gy + 1);
+        ctx.closePath();
+        if (loaded) {
+          ctx.fillStyle = colors.rnap;
+          ctx.fill();
+        } else {
+          ctx.strokeStyle = colors.rnap;
+          ctx.stroke();
+        }
+      }
+    }
+
     const f = this.#frame;
     if (!f) return;
     const maxH = base - MARGIN.top - 4;
@@ -356,6 +396,9 @@ export class LoopView {
       ctx.fillRect(x(f.leftPos[i]!) - 1, base - 4, 2, 5);
       ctx.fillRect(x(f.rightPos[i]!) - 1, base - 4, 2, 5);
     }
+
+    // Stationary RNAPs: filled circles straddling the lattice line.
+    drawRnaps(ctx, x, base, 3, f.rnaps);
   }
 }
 
@@ -416,9 +459,6 @@ export class Kymograph {
     // Faint TAD boundaries, so domains read in the kymograph too.
     ctx.fillStyle = colors.rule;
     for (const b of geometry.boundaries) ctx.fillRect(x(b), 0, 1, row);
-    // Loading sites, as thin red ticks.
-    ctx.fillStyle = colors.loading;
-    for (const s of loadingSites) ctx.fillRect(x(s), 0, 1, row);
     under?.(ctx, x);
 
     const style = (i: number) =>
@@ -427,6 +467,12 @@ export class Kymograph {
       ctx.fillStyle = style(i);
       ctx.fillRect(x(frame.leftPos[i]!) - 1, 0, 2, row);
       ctx.fillRect(x(frame.rightPos[i]!) - 1, 0, 2, row);
+    }
+
+    // Loaded RNAPs, so Pol II occupancy reads over time too.
+    ctx.fillStyle = colors.rnap;
+    for (const p of frame.rnaps) {
+      ctx.fillRect(x(p) - 1, 0, 2, row);
     }
   }
 }

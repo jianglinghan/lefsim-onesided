@@ -13,6 +13,41 @@ new_key_type! {
     pub struct LegKey;
     /// Typed handle into [`crate::World::lefs`].
     pub struct LefKey;
+    /// Typed handle into [`crate::World::rnaps`].
+    pub struct RnapKey;
+}
+
+/// A Pol II gene: RNA polymerase loads at its TSS and sits there, stationary.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Gene {
+    /// The transcription start site: where a loaded RNAP sits.
+    pub tss: Position,
+    /// Loading rate (events per time unit) while the TSS is free.
+    pub kin: f64,
+}
+
+/// A loaded, stationary RNA polymerase.
+#[derive(Copy, Clone, Debug)]
+pub struct Rnap {
+    /// The site it sits on (its gene's TSS).
+    pub pos: Position,
+    /// The gene it belongs to: an index into [`Pol2::genes`].
+    pub gene: usize,
+}
+
+/// The Pol II configuration: genes with their loading rates, the probability
+/// that an active leg meeting a stationary RNAP switches legs, and the RNAP
+/// unloading rate (dwell mean 1/off). The default is empty: no Pol II, and
+/// models without genes draw no random numbers and follow the original
+/// trajectories bit for bit.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Pol2 {
+    /// The genes RNAPs load at.
+    pub genes: Vec<Gene>,
+    /// Switch probability on encounter, in [0, 1]. Rate `switch_prob * step`.
+    pub switch_prob: f64,
+    /// Unloading rate of a loaded RNAP (mean dwell 1/off).
+    pub off: f64,
 }
 
 /// Per-leg intrinsic mobility status, set by the most recent CTCF interaction.

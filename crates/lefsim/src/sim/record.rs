@@ -352,15 +352,18 @@ impl TryFrom<EventColumns> for EventFrames {
 impl EventFrames {
     /// Row-kind names, indexed by the codes in the `kind` column: the
     /// [`Action`] variants, by [`Action::code`], and `Keyframe`, which isn't
-    /// an action. (`Evict` came after `Keyframe`, so it's last.)
-    pub const KIND_NAMES: [&str; 6] = [
-    "Step",
-    "Respawn",
-    "Keyframe",
-    "Evict",
-    "CtcfBind",
-    "CtcfRelease",
-];
+    /// an action. (`Evict` came after `Keyframe`, so it's out of order.)
+    /// `RnapLoad` and `RnapOff` change no legs, so an event frame holds no
+    /// rows for them; streams of models with Pol II genes can't be replayed.
+    pub const KIND_NAMES: [&str; 7] = [
+        "Step",
+        "Respawn",
+        "Keyframe",
+        "Evict",
+        "Switch",
+        "RnapLoad",
+        "RnapOff",
+    ];
 
     /// The `kind` code of keyframe rows.
     pub const KEYFRAME: u8 = 2;
@@ -455,13 +458,14 @@ impl EventFrames {
                 let lef = sim.world().legs[leg].lef;
                 sim.world().lefs[lef].legs.map(Some)
             }
-            // Binding changes no legs.
-            Action::CtcfBind { .. } => [None, None],
-            // Unbinding releases captured legs: record their new state.
-            Action::CtcfRelease { site } => {
-                let occ = sim.world().legs_at(site);
-                [occ.first().copied(), occ.get(1).copied()]
+            // A switch re-mobilities both legs; an RNAP load or unload
+            // changes no leg's state (positions and mobilities are as they
+            // were — only what lies ahead changed).
+            Action::Switch { leg } => {
+                let lef = sim.world().legs[leg].lef;
+                sim.world().lefs[lef].legs.map(Some)
             }
+            Action::RnapLoad { .. } | Action::RnapOff { .. } => [None, None],
         };
         for leg in legs.into_iter().flatten() {
             let state = &sim.world().legs[leg];

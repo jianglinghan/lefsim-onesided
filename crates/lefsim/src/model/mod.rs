@@ -16,9 +16,9 @@ pub mod world;
 
 pub use action::{Action, Extrusion, Rates};
 pub use distance::{DistanceError, LoopGraph};
-pub use entity::{Lef, LefKey, Leg, LegKey, Mobility};
+pub use entity::{Gene, Lef, LefKey, Leg, LegKey, Mobility, Pol2, Rnap, RnapKey};
 pub use lattice::{Ctcf, Direction, Lattice, LatticeError, Position, Site, SiteKind};
-pub use spawn::{Spawn, SpawnError, SpawnRule, populate, populate_with};
+pub use spawn::{Spawn, SpawnError, SpawnRule, WeightedSpawn, WeightsError, populate, populate_with};
 pub use world::{LefStates, LegState, World, WorldError};
 
 use rand_pcg::Pcg64;
@@ -89,7 +89,7 @@ impl Model {
     }
 
     pub fn spawn(&self) -> SpawnRule {
-        self.spawn.clone()
+        self.spawn
     }
 
     /// The parts, by value.
@@ -108,23 +108,6 @@ pub(crate) fn check(world: &World, rates: &Rates, spawn: &dyn Spawn) -> Result<(
     ] {
         if !(value.is_finite() && value > 0.0) {
             return Err(ModelError::BadRate { name, value });
-        }
-    }
-    // Dynamic CTCFs come as a pair of positive rates.
-    match (rates.ctcf_on, rates.ctcf_off) {
-        (None, None) => {}
-        (Some(on), Some(off)) => {
-            for (name, value) in [("ctcf_on", on), ("ctcf_off", off)] {
-                if !(value.is_finite() && value > 0.0) {
-                    return Err(ModelError::BadRate { name, value });
-                }
-            }
-        }
-        _ => {
-            return Err(ModelError::BadRate {
-                name: "ctcf_on",
-                value: f64::NAN,
-            })
         }
     }
     spawn
@@ -186,13 +169,13 @@ mod tests {
     #[test]
     fn model_checks_rates_and_spawn_rule() {
         let rule = SpawnRule::UniformNonCtcf;
-        assert!(Model::new(world(10, 3), Rates::default(), rule.clone()).is_ok());
+        assert!(Model::new(world(10, 3), Rates::default(), rule).is_ok());
 
         let bad = Rates {
             respawn: f64::NAN,
             ..Rates::default()
         };
-        let err = Model::new(world(10, 3), bad, rule.clone()).unwrap_err();
+        let err = Model::new(world(10, 3), bad, rule).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -207,7 +190,7 @@ mod tests {
             step: 0.0,
             ..Rates::default()
         };
-        assert!(Model::new(world(10, 3), bad, rule.clone()).is_err());
+        assert!(Model::new(world(10, 3), bad, rule).is_err());
 
         // Three LEFs on four sites: add_lef accepts them, the rule can't
         // guarantee a free site at respawn.

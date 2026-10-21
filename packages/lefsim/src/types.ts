@@ -17,7 +17,7 @@ export const DIRECTION = ["Left", "Right"] as const;
 export const SITE_KIND = ["Plain", "Ctcf"] as const;
 
 /** Row-kind names, indexed by the codes in a {@link DeltaChunk}'s `kind`. */
-export const ROW_KIND = ["Step", "Respawn", "Keyframe", "Evict", "CtcfBind", "CtcfRelease"] as const;
+export const ROW_KIND = ["Step", "Respawn", "Keyframe", "Evict", "Switch", "RnapLoad", "RnapOff"] as const;
 
 /** The `kind` code of keyframe rows. */
 export const KEYFRAME = 2;
@@ -64,12 +64,6 @@ export interface LiveState {
   leftMobility: Uint8Array;
   /** Each LEF's right leg mobility, as {@link MOBILITY} codes. */
   rightMobility: Uint8Array;
-  /**
-   * CTCF occupancy (1 bound, 0 unbound), one entry per CTCF in the
-   * lattice's CTCF order. Only present with dynamic CTCF rates; the arrays
-   * are views into WebAssembly memory, like the leg columns.
-   */
-  ctcfBound?: Uint8Array;
 }
 
 /**
@@ -119,23 +113,23 @@ export interface Rates {
   respawnBlocked: number;
   /** Respawn rate of a LEF with a captured leg, whatever the other leg does. */
   respawnCaptured: number;
-  /**
-   * CTCF binding rate. Set both this and `ctcfOff` to switch CTCFs to
-   * explicit occupancy dynamics: a bound CTCF certainly captures and
-   * evicts, an unbound one does neither (CTCF `strength` is then
-   * ignored), and the initial occupancy is drawn from equilibrium.
-   * Leave undefined for the static `strength` semantics.
-   */
-  ctcfOn?: number;
-  /**
-   * CTCF unbinding rate ("drop-off"): a bound CTCF unbinds at this rate
-   * and releases any captured leg. Requires `ctcfOn`.
-   */
-  ctcfOff?: number;
 }
 
 /** The built-in spawn rules: where a LEF lands when it (re)spawns. */
-export type SpawnRule = "uniform_non_ctcf" | "weighted_sites";
+export type SpawnRule = "uniform_non_ctcf";
+
+/**
+ * Preferential LEF loading sites (e.g. NIPBL loading): on a (re)spawn, plain
+ * lattice sites have weight 1 and each of these sites has weight `weight`, so
+ * a `weight` of 50 makes a loading site 50x as likely to receive a LEF. Only
+ * *where* LEFs land is weighted; the respawn rate is unchanged.
+ */
+export interface LoadingSites {
+  /** The loading sites: integers in [0, nSites), each on a plain (non-CTCF) site. */
+  sites: number[];
+  /** A loading site's weight relative to a plain site: finite, at least 1. */
+  weight: number;
+}
 
 /** A lattice's CTCFs as columns. `capturesFrom` holds {@link DIRECTION} codes. */
 export interface Ctcfs {
@@ -168,12 +162,6 @@ export interface Lefs {
   leftMobility: Uint8Array;
   /** Each LEF's right leg mobility, as {@link MOBILITY} codes. */
   rightMobility: Uint8Array;
-  /**
-   * CTCF occupancy (1 bound, 0 unbound), one entry per CTCF in the
-   * lattice's CTCF order. Only present with dynamic CTCF rates; the arrays
-   * are views into WebAssembly memory, like the leg columns.
-   */
-  ctcfBound?: Uint8Array;
 }
 
 /** The state of a simulation at one moment. Create with `createWorld` or `populate`. */
@@ -193,9 +181,19 @@ export interface Model {
   /** Where LEFs land when they respawn. */
   readonly spawnRule: SpawnRule;
   /**
-   * Per-site loading weights for "weighted_sites" (NIPBL-preferential
-   * loading): one weight per lattice site, high at loading-rich sites.
-   * Undefined for uniform loading.
+   * Pol II genes, if any: stationary RNAPs load at each gene's TSS and block
+   * it; a one-sided LEF's active leg meeting an RNAP switches legs with
+   * probability `switchProb`. Absent means no Pol II.
    */
-  readonly spawnWeight?: Float64Array;
+  readonly pol2?: Pol2;
+}
+
+/** The Pol II configuration: genes, the switch probability, the unload rate. */
+export interface Pol2 {
+  /** The genes RNAPs load at. */
+  genes: { site: number; kin: number }[];
+  /** Switch probability on encounter, in [0, 1]. */
+  switchProb: number;
+  /** RNAP unloading rate (mean dwell 1/off). */
+  off: number;
 }

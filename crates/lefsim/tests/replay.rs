@@ -24,8 +24,6 @@ const RATES: Rates = Rates {
     respawn: 0.02,
     respawn_blocked: 0.02,
     respawn_captured: 0.005,
-    ctcf_on: None,
-    ctcf_off: None,
 };
 const N_LEFS: usize = 8;
 

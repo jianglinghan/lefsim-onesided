@@ -182,9 +182,7 @@
   "step": 1.0,
   "respawn": 0.01,
   "respawn_blocked": 0.05,
-  "respawn_captured": 0.002,
-  "ctcf_on": null,
-  "ctcf_off": null
+  "respawn_captured": 0.002
  },
  "spawn": {
   "rule": "uniform_non_ctcf"

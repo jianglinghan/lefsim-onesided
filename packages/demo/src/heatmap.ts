@@ -190,7 +190,7 @@ const AXIS = 14;
  * on the vertical axis); `extent` is the number of sites the `k` bins cover.
  */
 export class SquareMap {
-  axis: { ctcfs: readonly AxisCtcf[]; extent: number } | undefined;
+  axis: { ctcfs: readonly AxisCtcf[]; genes?: readonly number[]; extent: number } | undefined;
   /** Width kept free on the right (e.g. for a colorbar), and what to draw there after the map. */
   rightLane = 0;
   decorate: ((ctx: CanvasRenderingContext2D, box: { left: number; top: number; size: number }) => void) | undefined;
@@ -279,6 +279,16 @@ export class SquareMap {
       ctx.lineTo(cx + s / 2, py);
       ctx.closePath();
       ctx.fill();
+    }
+    // Pol II genes: small green squares on both strips.
+    if (this.axis!.genes) {
+      ctx.fillStyle = colors.rnap;
+      for (const g of this.axis!.genes) {
+        const px = left + at(g);
+        ctx.fillRect(px - 1.5, AXIS / 2 - 1.5, 3, 3);
+        const py = top + at(g);
+        ctx.fillRect(MARGIN.left + AXIS / 2 - 1.5, py - 1.5, 3, 3);
+      }
     }
   }
 

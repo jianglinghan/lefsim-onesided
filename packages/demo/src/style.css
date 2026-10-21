@@ -9,6 +9,8 @@
   --extruding: #2a78d6;
   --held: #eb6834;
   --anchored: #6f7480;
+  --rnap: #2e9e62;
+  --loading: #cc3333;
   --probe: #7d4fd1;
   --focus: #2a78d6;
 }
@@ -25,6 +27,8 @@
     --extruding: #3987e5;
     --held: #d95926;
     --anchored: #9aa0ab;
+    --rnap: #45c47f;
+    --loading: #e0685e;
     --probe: #a07cf0;
     --focus: #3987e5;
   }
@@ -41,6 +45,8 @@
   --extruding: #3987e5;
   --held: #d95926;
   --anchored: #9aa0ab;
+  --rnap: #45c47f;
+  --loading: #e0685e;
   --probe: #a07cf0;
   --focus: #3987e5;
 }

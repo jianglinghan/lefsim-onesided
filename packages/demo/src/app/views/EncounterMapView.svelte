@@ -129,7 +129,7 @@
 
   function draw() {
     paint();
-    if (map) map.axis = { ctcfs: run.ctcfs, extent: enc.k * bin };
+    if (map) map.axis = { ctcfs: run.ctcfs, genes: run.genes, extent: enc.k * bin };
     map?.draw();
     drawBars();
     observed = enc.observedTime;

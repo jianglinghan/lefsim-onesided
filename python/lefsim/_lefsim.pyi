@@ -158,8 +158,6 @@ class Rates:
         respawn: Optional[float] = None,
         respawn_blocked: Optional[float] = None,
         respawn_captured: Optional[float] = None,
-        ctcf_on: Optional[float] = None,
-        ctcf_off: Optional[float] = None,
     ) -> None: ...
     @property
     def step(self) -> float:
@@ -174,12 +172,6 @@ class Rates:
     @property
     def respawn_captured(self) -> float:
         """Respawn rate of a LEF with a captured leg, whatever the other leg does."""
-    @property
-    def ctcf_on(self) -> Optional[float]:
-        """CTCF binding rate, if dynamic CTCF occupancy is enabled."""
-    @property
-    def ctcf_off(self) -> Optional[float]:
-        """CTCF unbinding rate (drop-off), if dynamic CTCF occupancy is enabled."""
     def to_dict(self) -> Any:
         """As plain Python data (dicts, lists, numbers and strings), in the same
         shape as the JSON.
@@ -363,8 +355,8 @@ class Sim:
     def __deepcopy__(self, memo: Any) -> "Sim": ...
     def step(self) -> Optional[tuple[float, Literal["Step", "Respawn", "Evict"], int]]:
         """Fire one event. Returns `(time, action, id)` — `id` is a `leg_id`
-        for "Step" and "Evict", a `lef_id` for "Respawn" — or `None` if no
-        events remain.
+        for "Step", "Evict" and "Switch", a `lef_id` for "Respawn", a gene
+        index for "RnapLoad", 0 for "RnapOff" — or `None` if no events remain.
         """
     def run_until(self, t_end: float) -> RunReport:
         """Fire every event at or before `t_end`, then set the clock to `t_end`.

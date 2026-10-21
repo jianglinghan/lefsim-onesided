@@ -20,9 +20,7 @@ fn build(seed: u64, strength: f64) -> Sim {
         respawn: 0.02,
         respawn_blocked: 0.02,
         respawn_captured: 0.005,
-        ctcf_on: None,
-    ctcf_off: None,
-};
+    };
     Sim::new(Model::new(world, rates, rule).unwrap(), seed)
 }
 
@@ -86,7 +84,7 @@ fn rows(f: &EventFrames) -> impl Iterator<Item = (Time, u32, u32, u8, u8)> + '_ 
 #[test]
 fn row_kinds_name_the_actions_and_keyframes() {
     // Codes 0, 1 and 3 are the actions (`Action::code`); 2 is the keyframe;
-    // 4 and 5 are the dynamic-CTCF actions.
+    // 4-6 are the Pol II actions.
     assert_eq!(
         EventFrames::KIND_NAMES,
         [
@@ -94,8 +92,9 @@ fn row_kinds_name_the_actions_and_keyframes() {
             "Respawn",
             "Keyframe",
             "Evict",
-            "CtcfBind",
-            "CtcfRelease"
+            "Switch",
+            "RnapLoad",
+            "RnapOff",
         ]
     );
     assert_eq!(EventFrames::KIND_NAMES[KEYFRAME as usize], "Keyframe");

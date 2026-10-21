@@ -14,12 +14,13 @@
 
 import wasmInit, { names, WasmSim, initSync as wasmInitSync } from "#wasm";
 
-import { modelArgs, seedBigInt } from "./model.ts";
+import { loadingArgs, modelArgs, pol2Args, seedBigInt } from "./model.ts";
 import type {
   DeltaChunk,
   Extrusion,
   Lattice,
   LiveState,
+  LoadingSites,
   Model,
   Rates,
   SnapshotChunk,
@@ -49,8 +50,10 @@ export type {
   Lattice,
   Lefs,
   LiveState,
+  LoadingSites,
   Mobility,
   Model,
+  Pol2,
   Rates,
   SnapshotChunk,
   SnapshotColumns,
@@ -125,6 +128,11 @@ export interface SimOptions {
    * Default "two_sided".
    */
   extrusion?: Extrusion;
+  /**
+   * Preferential loading sites for (re)spawns: plain lattice sites weigh 1
+   * against each site's `weight`. Default none (uniform).
+   */
+  loading?: LoadingSites;
 }
 
 /** What a run did: events fired by this call, the time reached, and why it stopped. */
@@ -168,7 +176,7 @@ export interface FiredEvent {
   /** When it fired. */
   time: number;
   /** Which action fired. */
-  action: "Step" | "Respawn" | "Evict" | "CtcfBind" | "CtcfRelease";
+  action: "Step" | "Respawn" | "Evict";
   /** The `leg_id` for a step or an eviction, the `lef_id` for a respawn. */
   id: number;
 }
@@ -247,6 +255,8 @@ export class Sim implements Disposable {
         seedBigInt(options.seed),
         options.startTime ?? 0,
         options.extrusion ?? "two_sided",
+        ...pol2Args(model),
+        ...loadingArgs(options.loading, model.world.lattice.nSites),
       );
     this.lattice = model.world.lattice;
     this.spawnRule = model.spawnRule;
@@ -538,8 +548,16 @@ export class Sim implements Disposable {
       rightPos: new Uint32Array(buf, sim.right_pos_ptr(), n),
       leftMobility: new Uint8Array(buf, sim.left_mob_ptr(), n),
       rightMobility: new Uint8Array(buf, sim.right_mob_ptr(), n),
-      ctcfBound: new Uint8Array(buf, sim.ctcf_bound_ptr(), sim.n_ctcfs()),
     };
+  }
+
+  /**
+   * The sites of all loaded RNAPs (the live Pol II occupancy), copied.
+   * Empty unless the model has Pol II genes. Like {@link state}'s arrays,
+   * the underlying wasm view is only valid until the next call into the Sim.
+   */
+  rnapState(): Uint32Array {
+    return this.#sim.rnap_state().slice();
   }
 
   /** Release the WebAssembly memory. Idempotent. */

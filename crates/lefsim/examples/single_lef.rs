@@ -29,8 +29,9 @@ fn describe(sim: &Sim, action: Action) -> String {
         Action::Step { leg } => format!("Step leg {}", sim.leg_id(leg).unwrap()),
         Action::Respawn { lef } => format!("Respawn lef {}", sim.lef_id(lef).unwrap()),
         Action::Evict { leg } => format!("Evict leg {}", sim.leg_id(leg).unwrap()),
-        Action::CtcfBind { site } => format!("CtcfBind site {site}"),
-        Action::CtcfRelease { site } => format!("CtcfRelease site {site}"),
+        Action::Switch { leg } => format!("Switch leg {}", sim.leg_id(leg).unwrap()),
+        Action::RnapLoad { gene } => format!("RnapLoad gene {gene}"),
+        Action::RnapOff { .. } => "RnapOff".to_string(),
     }
 }
 

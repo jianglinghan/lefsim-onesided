@@ -21,9 +21,7 @@ fn rates() -> Rates {
         respawn_blocked: 0.02,
 
         respawn_captured: 0.005,
-        ctcf_on: None,
-    ctcf_off: None,
-}
+    }
 }
 
 fn build(seed: u64) -> Sim {

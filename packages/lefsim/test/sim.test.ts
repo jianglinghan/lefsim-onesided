@@ -84,6 +84,26 @@ describe("building a model", () => {
     expect(populate(lattice, 20, { seed: 2 })).not.toEqual(a);
   });
 
+  it("loading sites are snapped up first, reproducibly", () => {
+    const lattice = createLattice(1000);
+    const loading = { sites: Array.from({ length: 10 }, (_, i) => 100 + i), weight: 50 };
+    const world = populate(lattice, 200, { seed: 1, loading });
+    // Each draw hits a loading site with p ~ 0.34, so all ten are taken early.
+    const hits = world.lefs.leftPos.filter((p) => p >= 100 && p < 110).length;
+    expect(hits).toBe(10);
+    expect(populate(lattice, 200, { seed: 1, loading })).toEqual(world);
+  });
+
+  it("a Sim with loading sites runs deterministically", () => {
+    const loading = { sites: [100, 101, 102], weight: 50 };
+    const model = () => createModel(populate(createLattice(1000), 20, { seed: 1, loading }));
+    using a = new Sim(model(), { seed: 0, loading });
+    using b = new Sim(model(), { seed: 0, loading });
+    a.runUntil(100);
+    b.runUntil(100);
+    expect(a.world()).toEqual(b.world());
+  });
+
   it("createModel fills missing rates with the core's defaults", () => {
     const model = createModel(createWorld(createLattice(100)));
     expect(model.rates).toEqual({ step: 1, respawn: 1e-3, respawnBlocked: 1e-2, respawnCaptured: 1e-3 });
@@ -129,6 +149,9 @@ describe("building a model", () => {
     [() => populate(lattice10(), 1, { seed: -1 }), /seed/],
     [() => populate(lattice10(), 1, { seed: 1.5 }), /seed/],
     [() => populate(lattice10(), 1, { seed: 2n ** 64n }), /seed/],
+    [() => populate(lattice10(), 1, { loading: { sites: [3], weight: 50 } }), /a CTCF site/],
+    [() => populate(lattice10(), 1, { loading: { sites: [99], weight: 50 } }), /loading site/],
+    [() => populate(lattice10(), 1, { loading: { sites: [2], weight: 0.5 } }), /loading weight/],
     [() => createModel(createWorld(lattice10()), { step: 0 }), /step rate must be positive/],
     [() => createModel(createWorld(lattice10()), { respawn: Number.NaN }), /respawn rate must be positive/],
     [() => createModel(createWorld(lattice10()), { respawnBlocked: 0 }), /respawn_blocked rate must be positive/],

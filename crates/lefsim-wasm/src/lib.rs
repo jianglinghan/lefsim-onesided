@@ -17,8 +17,8 @@
 use js_sys::{Float64Array, Object, Reflect, Uint8Array, Uint32Array};
 use lefsim::{
     Ctcf, Direction, EventFrames, EventRecorder, Extrusion, Lattice, LefFrames, LefStates,
-    LoopGraph, Mobility, Model, Rates, Recorder, RunReport, SampleMode, SiteKind, SpawnRule,
-    StopReason, World,
+    LoopGraph, Mobility, Model, Rates, Recorder, RunReport, SampleMode, Spawn, SpawnRule,
+    StopReason, WeightedSpawn, World,
 };
 use wasm_bindgen::prelude::*;
 
@@ -71,9 +71,6 @@ pub struct WasmSim {
     /// The world's LEF table as of the last `sync_state`. Refilled in place,
     /// so its buffers (and the views JS builds on them) don't move.
     state: LefStates,
-    /// CTCF occupancy as of the last `sync_state`, one byte per CTCF in the
-    /// lattice's CTCF order.
-    ctcf_bound: Vec<u8>,
     /// The most recent grid recorder, kept so that consecutive recording
     /// calls on the same grid continue it instead of repeating points.
     grid: Option<Recorder>,
@@ -191,6 +188,25 @@ fn rule_from(name: &str) -> Result<SpawnRule, JsError> {
     }
 }
 
+/// The spawn rule from its name, upgraded to a [`WeightedSpawn`] when
+/// `loading_sites` is non-empty: plain sites weight 1, loading sites
+/// `loading_weight`.
+fn spawn_from(
+    name: &str,
+    n_sites: u32,
+    ctcf_sites: &[u32],
+    loading_sites: &[u32],
+    loading_weight: f64,
+) -> Result<Box<dyn Spawn>, JsError> {
+    if loading_sites.is_empty() {
+        return Ok(Box::new(rule_from(name)?));
+    }
+    Ok(Box::new(
+        WeightedSpawn::loading(n_sites, ctcf_sites, loading_sites, loading_weight)
+            .map_err(js_err)?,
+    ))
+}
+
 /// The extrusion leg-rule from its name.
 fn extrusion_from(name: &str) -> Result<Extrusion, JsError> {
     match name {
@@ -200,23 +216,6 @@ fn extrusion_from(name: &str) -> Result<Extrusion, JsError> {
             "unknown extrusion {name:?} (available: \"two_sided\", \"one_sided\")"
         ))),
     }
-}
-
-/// The spawn rule, from its name plus an optional per-site weight column
-/// (which selects `weighted_sites`, e.g. NIPBL-preferential loading).
-fn spawn_rule_from(name: &str, weights: Option<Vec<f64>>) -> Result<SpawnRule, JsError> {
-    if let Some(w) = weights {
-        if w.iter().any(|x| !x.is_finite() || *x < 0.0) {
-            return Err(JsError::new("spawn weights must be non-negative and finite"));
-        }
-        return Ok(SpawnRule::WeightedSites { weights: w });
-    }
-    if name == "weighted_sites" {
-        return Err(JsError::new(
-            "spawn rule \"weighted_sites\" requires a per-site weight column",
-        ));
-    }
-    rule_from(name)
 }
 
 /// `{leftPos, rightPos, leftMobility, rightMobility}`, copied.
@@ -251,22 +250,43 @@ fn model_from(
     respawn: f64,
     respawn_blocked: f64,
     respawn_captured: f64,
-    ctcf_on: Option<f64>,
-    ctcf_off: Option<f64>,
-    rule: SpawnRule,
+    spawn_rule: &str,
+    genes_site: &[u32],
+    genes_kin: &[f64],
+    pol_switch: f64,
+    pol_off: f64,
 ) -> Result<Model, JsError> {
     let lattice = lattice_from(n_sites, site, side, strength)?;
     let lefs = lefs_from(left_pos, right_pos, left_mob, right_mob)?;
-    let world = World::from_lef_states(lattice, &lefs).map_err(js_err)?;
+    let mut world = World::from_lef_states(lattice, &lefs).map_err(js_err)?;
+    if !genes_site.is_empty() {
+        if genes_site.len() != genes_kin.len() {
+            return Err(JsError::new(&format!(
+                "genes_site has {} entries, genes_kin has {}",
+                genes_site.len(),
+                genes_kin.len()
+            )));
+        }
+        let genes = genes_site
+            .iter()
+            .zip(genes_kin)
+            .map(|(&tss, &kin)| lefsim::Gene { tss, kin })
+            .collect();
+        world
+            .set_pol2(lefsim::Pol2 {
+                genes,
+                switch_prob: pol_switch,
+                off: pol_off,
+            })
+            .map_err(js_err)?;
+    }
     let rates = Rates {
         step,
         respawn,
         respawn_blocked,
         respawn_captured,
-        ctcf_on,
-        ctcf_off,
     };
-    Model::new(world, rates, rule).map_err(js_err)
+    Model::new(world, rates, rule_from(spawn_rule)?).map_err(js_err)
 }
 
 // ----- validation and construction outside a sim -----
@@ -305,7 +325,6 @@ pub fn check_world(
 /// Throws unless the world, rates and spawn rule make a valid model.
 #[wasm_bindgen]
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 pub fn check_model(
     n_sites: u32,
     site: &[u32],
@@ -319,10 +338,7 @@ pub fn check_model(
     respawn: f64,
     respawn_blocked: f64,
     respawn_captured: f64,
-    ctcf_on: Option<f64>,
-    ctcf_off: Option<f64>,
     spawn_rule: &str,
-    spawn_weights: Option<Vec<f64>>,
 ) -> Result<(), JsError> {
     model_from(
         n_sites,
@@ -337,15 +353,19 @@ pub fn check_model(
         respawn,
         respawn_blocked,
         respawn_captured,
-        ctcf_on,
-        ctcf_off,
-        spawn_rule_from(spawn_rule, spawn_weights)?,
+        spawn_rule,
+        &[],
+        &[],
+        0.0,
+        0.0,
     )
     .map(|_| ())
 }
 
 /// `n_lefs` LEFs placed by the spawn rule under the `extrusion` leg-rule
-/// (`"two_sided"` or `"one_sided"`), as the LEF columns.
+/// (`"two_sided"` or `"one_sided"`), as the LEF columns. With `loading_sites`
+/// non-empty the rule is weighted: plain sites have weight 1 and each loading
+/// site `loading_weight`.
 #[wasm_bindgen]
 #[allow(clippy::too_many_arguments)]
 pub fn populate(
@@ -357,12 +377,19 @@ pub fn populate(
     seed: u64,
     spawn_rule: &str,
     extrusion: &str,
-    spawn_weights: Option<Vec<f64>>,
+    loading_sites: &[u32],
+    loading_weight: f64,
 ) -> Result<Object, JsError> {
     let lattice = lattice_from(n_sites, site, side, strength)?;
-    let rule = spawn_rule_from(spawn_rule, spawn_weights)?;
-    let world = lefsim::populate_with(lattice, n_lefs as usize, &rule, seed, extrusion_from(extrusion)?)
-        .map_err(js_err)?;
+    let rule = spawn_from(spawn_rule, n_sites, site, loading_sites, loading_weight)?;
+    let world = lefsim::populate_with(
+        lattice,
+        n_lefs as usize,
+        &*rule,
+        seed,
+        extrusion_from(extrusion)?,
+    )
+    .map_err(js_err)?;
     Ok(lefs_object(&world.lef_states()))
 }
 
@@ -378,8 +405,6 @@ fn rates_object(r: Rates) -> Object {
     set(&obj, "respawn", r.respawn);
     set(&obj, "respawnBlocked", r.respawn_blocked);
     set(&obj, "respawnCaptured", r.respawn_captured);
-    set(&obj, "ctcfOn", r.ctcf_on);
-    set(&obj, "ctcfOff", r.ctcf_off);
     obj
 }
 
@@ -400,6 +425,12 @@ impl WasmSim {
     /// A sim of the model given as columns (see `check_model`), from
     /// `start_time`, under the `extrusion` leg-rule (`"two_sided"` or
     /// `"one_sided"`). `side` and the mobility columns hold the core's codes.
+    /// With `genes_site` non-empty, the world gains Pol II genes loading
+    /// stationary RNAPs at those TSSs (`genes_kin` per gene): a one-sided
+    /// active leg meeting an RNAP switches legs with probability
+    /// `pol_switch`, and an RNAP unloads at rate `pol_off`. With
+    /// `loading_sites` non-empty, (re)spawns are weighted: plain sites have
+    /// weight 1, each loading site `loading_weight`.
     #[wasm_bindgen(constructor)]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -415,23 +446,22 @@ impl WasmSim {
         respawn: f64,
         respawn_blocked: f64,
         respawn_captured: f64,
-        ctcf_on: Option<f64>,
-        ctcf_off: Option<f64>,
         spawn_rule: &str,
-        spawn_weights: Option<Vec<f64>>,
         seed: u64,
         start_time: f64,
         extrusion: &str,
+        genes_site: &[u32],
+        genes_kin: &[f64],
+        pol_switch: f64,
+        pol_off: f64,
+        loading_sites: &[u32],
+        loading_weight: f64,
     ) -> Result<WasmSim, JsError> {
         if !start_time.is_finite() {
             return Err(JsError::new(&format!(
                 "startTime must be finite, got {start_time}"
             )));
         }
-        let extrusion = extrusion_from(extrusion)?;
-        // The weighted rule rides in `spawn_weights` and becomes the model's
-        // own spawn rule, so respawns load preferentially too.
-        let rule = spawn_rule_from(spawn_rule, spawn_weights)?;
         let model = model_from(
             n_sites,
             site,
@@ -445,19 +475,34 @@ impl WasmSim {
             respawn,
             respawn_blocked,
             respawn_captured,
-            ctcf_on,
-            ctcf_off,
-            rule,
+            spawn_rule,
+            genes_site,
+            genes_kin,
+            pol_switch,
+            pol_off,
         )?;
-        let sim = lefsim::Sim::with_extrusion_from(model, seed, extrusion, start_time);
+        let extrusion = extrusion_from(extrusion)?;
+        let sim = if loading_sites.is_empty() {
+            lefsim::Sim::with_extrusion_from(model, seed, extrusion, start_time)
+        } else {
+            let spawn =
+                WeightedSpawn::loading(n_sites, site, loading_sites, loading_weight)
+                    .map_err(js_err)?;
+            let (world, rates, _) = model.into_parts();
+            lefsim::Sim::with_spawn_extrusion_from(world, rates, spawn, extrusion, seed, start_time)
+                .map_err(js_err)?
+        };
         let state = sim.world().lef_states();
-        let ctcf_bound = ctcf_bound_column(&sim);
         Ok(WasmSim {
             sim,
             state,
-            ctcf_bound,
             grid: None,
         })
+    }
+
+    /// The sites of all loaded RNAPs (the live Pol II occupancy).
+    pub fn rnap_state(&self) -> Uint32Array {
+        Uint32Array::from(self.sim.world().rnap_sites().as_slice())
     }
 
     // ----- driving -----
@@ -712,22 +757,22 @@ impl WasmSim {
     }
 
     /// Fire one event. Returns `[time, actionCode, id]` (`id` is a `leg_id`
-    /// for a step or an eviction, a `lef_id` for a respawn) or `null` if none
-    /// remain.
+    /// for a step, eviction or switch, a `lef_id` for a respawn, a gene index
+    /// for an RNAP load, 0 for an RNAP unload) or `null` if none remain.
     pub fn step(&mut self) -> JsValue {
         match self.sim.step() {
             None => JsValue::NULL,
             Some((t, action)) => {
                 let id = match action {
-                    lefsim::Action::Step { leg } | lefsim::Action::Evict { leg } => {
-                        self.sim.leg_id(leg).map(JsValue::from)
-                    }
-                    lefsim::Action::Respawn { lef } => self.sim.lef_id(lef).map(JsValue::from),
-                    // CTCF actions have no leg: null id.
-                    lefsim::Action::CtcfBind { .. } | lefsim::Action::CtcfRelease { .. } => None,
-                };
-                let id = id.unwrap_or(JsValue::NULL);
-                js_sys::Array::of3(&t.into(), &action.code().into(), &id).into()
+                    lefsim::Action::Step { leg }
+                    | lefsim::Action::Evict { leg }
+                    | lefsim::Action::Switch { leg } => self.sim.leg_id(leg),
+                    lefsim::Action::Respawn { lef } => self.sim.lef_id(lef),
+                    lefsim::Action::RnapLoad { gene } => Some(gene as u32),
+                    lefsim::Action::RnapOff { .. } => Some(0),
+                }
+                .expect("the sim's own entity");
+                js_sys::Array::of3(&t.into(), &action.code().into(), &id.into()).into()
             }
         }
     }
@@ -737,7 +782,6 @@ impl WasmSim {
         WasmSim {
             sim: self.sim.clone(),
             state: self.state.clone(),
-            ctcf_bound: self.ctcf_bound.clone(),
             grid: self.grid.clone(),
         }
     }
@@ -749,7 +793,6 @@ impl WasmSim {
     pub fn sync_state(&mut self) {
         self.state.clear();
         self.sim.world().push_lef_states(&mut self.state);
-        self.ctcf_bound = ctcf_bound_column(&self.sim);
     }
 
     pub fn left_pos_ptr(&self) -> *const u32 {
@@ -767,32 +810,6 @@ impl WasmSim {
     pub fn right_mob_ptr(&self) -> *const u8 {
         Mobility::as_codes(&self.state.right_mobility).as_ptr()
     }
-
-    /// Number of CTCFs (the length of the `ctcf_bound` column).
-    pub fn n_ctcfs(&self) -> u32 {
-        self.ctcf_bound.len() as u32
-    }
-
-    /// CTCF occupancy codes (1 bound, 0 unbound), aligned with the lattice's
-    /// CTCF list. Valid until the next call into this sim.
-    pub fn ctcf_bound_ptr(&self) -> *const u8 {
-        self.ctcf_bound.as_ptr()
-    }
-}
-
-/// CTCF occupancy as a column, in site order (one byte per CTCF).
-fn ctcf_bound_column(sim: &lefsim::Sim) -> Vec<u8> {
-    let world = sim.world();
-    world
-        .lattice()
-        .sites()
-        .iter()
-        .enumerate()
-        .filter_map(|(i, s)| match s.kind {
-            SiteKind::Ctcf { .. } => Some(u8::from(world.ctcf_bound(i as u32))),
-            _ => None,
-        })
-        .collect()
 }
 
 // ----- effective distance -----

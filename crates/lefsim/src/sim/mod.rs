@@ -16,7 +16,7 @@
 //! `leg_id = 2 * lef_id + side` where side 0 is the left-facing leg and side
 //! 1 the right-facing one. Slotmap keys stay internal.
 
-pub(crate) mod engine;
+mod engine;
 mod heap;
 pub mod record;
 mod replay;
@@ -151,14 +151,29 @@ impl Sim {
         spawn: S,
         seed: u64,
     ) -> Result<Self, ModelError> {
+        Self::with_spawn_extrusion_from(world, rates, spawn, Extrusion::TwoSided, seed, 0.0)
+    }
+
+    /// [`Sim::with_spawn`] under a chosen [`Extrusion`] leg-rule, with the
+    /// clock starting at `start_time`. The world should come from
+    /// [`populate_with`] with the same leg-rule and rule, so spawn and
+    /// respawn agree.
+    pub fn with_spawn_extrusion_from<S: Spawn + Send + Sync + 'static>(
+        world: World,
+        rates: Rates,
+        spawn: S,
+        extrusion: Extrusion,
+        seed: u64,
+        start_time: Time,
+    ) -> Result<Self, ModelError> {
         model::check(&world, &rates, &spawn)?;
         Ok(Self::start_world(
             world,
             rates,
             SpawnSource::Custom(Arc::new(spawn)),
-            Extrusion::TwoSided,
+            extrusion,
             seed,
-            0.0,
+            start_time,
         ))
     }
 
@@ -186,9 +201,8 @@ impl Sim {
         }
 
         let mut rng = SimRng::seed_from_u64(seed);
-        let mut world = world;
         let mut engine = Engine::new(rates, extrusion, start_time);
-        engine.initialize(&mut world, &mut rng);
+        engine.initialize(&world, &mut rng);
         Sim {
             initial_world: world.clone(),
             seed,
@@ -253,11 +267,11 @@ impl Sim {
     /// recording came from: `Sim::with_start_time(initial, seed, start)`
     /// replays this run from its start, event for event.
     pub fn initial_model(&self) -> Option<Model> {
-        match &self.spawn {
+        match self.spawn {
             SpawnSource::BuiltIn(spawn) => Some(Model {
                 world: self.initial_world.clone(),
                 rates: self.rates(),
-                spawn: spawn.clone(),
+                spawn,
             }),
             SpawnSource::Custom(_) => None,
         }
@@ -281,11 +295,11 @@ impl Sim {
     /// continues from here with fresh randomness. To continue bit for bit,
     /// clone the sim instead.
     pub fn model(&self) -> Option<Model> {
-        match &self.spawn {
+        match self.spawn {
             SpawnSource::BuiltIn(spawn) => Some(Model {
                 world: self.world.clone(),
                 rates: self.rates(),
-                spawn: spawn.clone(),
+                spawn,
             }),
             SpawnSource::Custom(_) => None,
         }
@@ -514,6 +528,89 @@ mod tests {
     }
 
     #[test]
+    fn one_sided_with_pol2_runs_the_m5v3_rules() {
+        use crate::model::{Gene, Pol2, populate_with};
+        let mut world = populate_with(
+            two_ctcf_lattice(),
+            6,
+            &SpawnRule::UniformNonCtcf,
+            5,
+            Extrusion::OneSided,
+        )
+        .unwrap();
+        world
+            .set_pol2(Pol2 {
+                genes: vec![
+                    Gene { tss: 35, kin: 0.05 },
+                    Gene { tss: 65, kin: 0.03 },
+                ],
+                switch_prob: 1.0,
+                off: 0.02,
+            })
+            .unwrap();
+        let model = Model::new(world, Rates::default(), SpawnRule::UniformNonCtcf).unwrap();
+        let mut sim = Sim::with_extrusion(model, 7, Extrusion::OneSided);
+
+        let mut switches = 0u32;
+        let mut loads = 0u32;
+        let mut offs = 0u32;
+        for _ in 0..5000 {
+            let Some((_, action)) = sim.step() else { break };
+            match action {
+                Action::Switch { .. } => switches += 1,
+                Action::RnapLoad { .. } => loads += 1,
+                Action::RnapOff { .. } => offs += 1,
+                _ => {}
+            }
+            // The one-sided invariant still holds with Pol II in play.
+            for i in 0..sim.n_lefs() {
+                let ((_, lm), (_, rm)) = sim.world().lef_state(i).unwrap();
+                assert!(
+                    (lm == Mobility::Moving && rm == Mobility::Anchored)
+                        || (lm == Mobility::Anchored && rm == Mobility::Moving),
+                    "LEF {i} has mobilities [{lm:?}, {rm:?}], want one Moving and one Anchored"
+                );
+            }
+            // RNAP bookkeeping is consistent: at most one per gene, and the
+            // site index agrees with the RNAP table.
+            assert!(sim.world().n_rnaps() <= 2);
+            for p in sim.world().rnap_sites() {
+                assert!(sim.world().rnap_at(p).is_some());
+            }
+        }
+        // The M5_v3 mechanisms actually fired: RNAPs loaded and unloaded,
+        // and legs switched at them.
+        assert!(loads > 0, "no RNAP ever loaded");
+        assert!(offs > 0, "no RNAP ever unloaded");
+        assert!(switches > 0, "no leg ever switched at an RNAP");
+
+        // A seeded run with Pol II reproduces bit for bit.
+        let mut world = populate_with(
+            two_ctcf_lattice(),
+            6,
+            &SpawnRule::UniformNonCtcf,
+            5,
+            Extrusion::OneSided,
+        )
+        .unwrap();
+        world
+            .set_pol2(Pol2 {
+                genes: vec![
+                    Gene { tss: 35, kin: 0.05 },
+                    Gene { tss: 65, kin: 0.03 },
+                ],
+                switch_prob: 1.0,
+                off: 0.02,
+            })
+            .unwrap();
+        let model = Model::new(world, Rates::default(), SpawnRule::UniformNonCtcf).unwrap();
+        let mut again = Sim::with_extrusion(model, 7, Extrusion::OneSided);
+        again.run_events(sim.n_events());
+        assert_eq!(sim.world().lef_states(), again.world().lef_states());
+        assert_eq!(sim.world().rnap_sites(), again.world().rnap_sites());
+    }
+
+    #[test]
     fn sim_is_send_sync_and_clone() {
         fn assert_traits<T: Send + Sync + Clone>() {}
         assert_traits::<Sim>();
@@ -548,7 +645,7 @@ mod tests {
 
         let mut rng = SimRng::seed_from_u64(seed);
         let mut engine = Engine::new(Rates::default(), Extrusion::TwoSided, 0.0);
-        engine.initialize(&mut world, &mut rng);
+        engine.initialize(&world, &mut rng);
         let mut touched = Touched::default();
 
         for _ in 0..5000 {

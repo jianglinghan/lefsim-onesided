@@ -13,7 +13,7 @@
 use slotmap::SecondaryMap;
 use std::cmp::Ordering;
 
-use crate::model::{Action, LefKey, LegKey};
+use crate::model::{Action, LefKey, LegKey, RnapKey};
 
 /// Heap priority. Smaller compares first (min-heap). Total order via
 /// [`f64::total_cmp`]; `Priority::NEVER` is `+∞` and acts as a sentinel
@@ -52,15 +52,15 @@ struct Node {
 /// Min-heap of actions keyed by event time, supporting O(log n) updates
 /// of any element's priority by `Action` key.
 ///
-/// Internally a flat binary heap (`Vec<Node>`) plus two slotmap-backed
+/// Internally a flat binary heap (`Vec<Node>`) plus slotmap-backed
 /// position indices — one per action variant — so a node's heap index
 /// can be found from its `Action` in O(1) without hashing.
 ///
-/// Invariant: every action ever inserted stays in the heap for the
-/// lifetime of the simulation. To express "never fires", call
-/// [`IndexedHeap::update`] with `Priority::NEVER`; the node moves to
-/// the bottom but isn't removed. Matches the fixed-cardinality LEF
-/// model where actions are created once at init and never destroyed.
+/// Invariant: an action stays in the heap once inserted. To express "never
+/// fires", call [`IndexedHeap::update`] with `Priority::NEVER`; the node
+/// moves to the bottom but isn't removed. Leg and LEF actions are created
+/// once at init; `RnapOff` actions are appended as RNAPs load, and a stale
+/// one (its RNAP already unloaded) reschedules to never.
 #[derive(Clone)]
 pub(super) struct IndexedHeap {
     nodes: Vec<Node>,
@@ -70,10 +70,13 @@ pub(super) struct IndexedHeap {
     respawn_pos: SecondaryMap<LefKey, usize>,
     /// Heap index of `Action::Evict { leg }`.
     evict_pos: SecondaryMap<LegKey, usize>,
-    /// Heap indexes of the CTCF actions, by site: `[bind, release]`.
-    /// `usize::MAX` marks an action not in the heap (never true mid-run:
-    /// every action is inserted in `Engine::initialize`).
-    ctcf_pos: Vec<[usize; 2]>,
+    /// Heap index of `Action::Switch { leg }`.
+    switch_pos: SecondaryMap<LegKey, usize>,
+    /// Heap index of `Action::RnapOff { rnap }`.
+    rnap_off_pos: SecondaryMap<RnapKey, usize>,
+    /// Heap index of `Action::RnapLoad { gene }`, by gene index; `MAX` for
+    /// none (a gene beyond the vec is never in the heap).
+    rnap_load_pos: Vec<usize>,
 }
 
 impl IndexedHeap {
@@ -83,13 +86,10 @@ impl IndexedHeap {
             step_pos: SecondaryMap::new(),
             respawn_pos: SecondaryMap::new(),
             evict_pos: SecondaryMap::new(),
-            ctcf_pos: Vec::new(),
+            switch_pos: SecondaryMap::new(),
+            rnap_off_pos: SecondaryMap::new(),
+            rnap_load_pos: Vec::new(),
         }
-    }
-
-    /// Size the CTCF action lookup for a lattice of `n_sites` sites.
-    pub fn with_sites(&mut self, n_sites: usize) {
-        self.ctcf_pos = vec![[usize::MAX; 2]; n_sites];
     }
 
     pub fn with_capacity(cap: usize) -> Self {
@@ -98,7 +98,9 @@ impl IndexedHeap {
             step_pos: SecondaryMap::with_capacity(cap),
             respawn_pos: SecondaryMap::with_capacity(cap),
             evict_pos: SecondaryMap::with_capacity(cap),
-            ctcf_pos: Vec::new(),
+            switch_pos: SecondaryMap::with_capacity(cap),
+            rnap_off_pos: SecondaryMap::with_capacity(cap),
+            rnap_load_pos: Vec::new(),
         }
     }
 
@@ -151,14 +153,13 @@ impl IndexedHeap {
             Action::Step { leg } => self.step_pos.get(leg).copied(),
             Action::Respawn { lef } => self.respawn_pos.get(lef).copied(),
             Action::Evict { leg } => self.evict_pos.get(leg).copied(),
-            Action::CtcfBind { site } => match self.ctcf_pos[site as usize][0] {
-                usize::MAX => None,
-                i => Some(i),
-            },
-            Action::CtcfRelease { site } => match self.ctcf_pos[site as usize][1] {
-                usize::MAX => None,
-                i => Some(i),
-            },
+            Action::Switch { leg } => self.switch_pos.get(leg).copied(),
+            Action::RnapOff { rnap } => self.rnap_off_pos.get(rnap).copied(),
+            Action::RnapLoad { gene } => self
+                .rnap_load_pos
+                .get(gene)
+                .copied()
+                .filter(|&i| i != usize::MAX),
         }
     }
 
@@ -173,11 +174,17 @@ impl IndexedHeap {
             Action::Evict { leg } => {
                 self.evict_pos.insert(leg, idx);
             }
-            Action::CtcfBind { site } => {
-                self.ctcf_pos[site as usize][0] = idx;
+            Action::Switch { leg } => {
+                self.switch_pos.insert(leg, idx);
             }
-            Action::CtcfRelease { site } => {
-                self.ctcf_pos[site as usize][1] = idx;
+            Action::RnapOff { rnap } => {
+                self.rnap_off_pos.insert(rnap, idx);
+            }
+            Action::RnapLoad { gene } => {
+                if self.rnap_load_pos.len() <= gene {
+                    self.rnap_load_pos.resize(gene + 1, usize::MAX);
+                }
+                self.rnap_load_pos[gene] = idx;
             }
         }
     }

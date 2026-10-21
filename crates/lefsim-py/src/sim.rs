@@ -469,17 +469,17 @@ impl PySim {
     // ----- running -----
 
     /// Fire one event. Returns `(time, action, id)` — `id` is a `leg_id`
-    /// for "Step" and "Evict", a `lef_id` for "Respawn" — or `None` if no
-    /// events remain.
+    /// for "Step", "Evict" and "Switch", a `lef_id` for "Respawn", a gene
+    /// index for "RnapLoad", 0 for "RnapOff" — or `None` if no events remain.
     fn step(&mut self) -> PyResult<Option<(f64, &'static str, u32)>> {
         let sim = self.sim.as_mut().ok_or_else(consumed)?;
         Ok(sim.step().map(|(t, action)| match action {
             Action::Step { leg } => (t, "Step", sim.leg_id(leg).expect("own leg")),
             Action::Respawn { lef } => (t, "Respawn", sim.lef_id(lef).expect("own lef")),
             Action::Evict { leg } => (t, "Evict", sim.leg_id(leg).expect("own leg")),
-            // No leg: the CTCF's site stands in as the id.
-            Action::CtcfBind { site } => (t, "CtcfBind", site),
-            Action::CtcfRelease { site } => (t, "CtcfRelease", site),
+            Action::Switch { leg } => (t, "Switch", sim.leg_id(leg).expect("own leg")),
+            Action::RnapLoad { gene } => (t, "RnapLoad", gene as u32),
+            Action::RnapOff { .. } => (t, "RnapOff", 0),
         }))
     }
 
@@ -625,6 +625,13 @@ impl PySim {
         max_rows: Option<usize>,
     ) -> PyResult<PyStream> {
         check_time("t_end", t_end)?;
+        if !self.sim.as_ref().ok_or_else(consumed)?.world().pol2().genes.is_empty() {
+            return Err(value_error(
+                "streaming a model with Pol II genes is not supported yet: \
+                 event streams don't capture RNAP load/unload, so a replay \
+                 would diverge from the run",
+            ));
+        }
         if keyframes && !events {
             return Err(value_error("keyframes=True requires events=True"));
         }

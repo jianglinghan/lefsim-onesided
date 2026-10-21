@@ -1,7 +1,8 @@
 //! Spawn rules: where a LEF lands when it (re)spawns.
 //!
 //! [`Spawn`] is what a rule can do; [`SpawnRule`] lists the built-in rules as
-//! plain data; [`populate`] uses a rule to build a starting world.
+//! plain data; [`WeightedSpawn`] adds preferential loading sites; [`populate`]
+//! uses a rule to build a starting world.
 
 use rand::{Rng, SeedableRng};
 
@@ -27,20 +28,13 @@ pub trait Spawn {
 }
 
 /// The built-in spawn rules.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(tag = "rule", rename_all = "snake_case"))]
 pub enum SpawnRule {
     /// Uniform among `Plain` sites that no leg occupies.
     #[default]
     UniformNonCtcf,
-    /// Per-site loading weights: a LEF loads at a site with probability
-    /// proportional to its weight (high-weight sites are NIPBL-rich loading
-    /// preferences; weight 1 is the background). Sampling is rejection over
-    /// free plain sites, so a run never deadlocks; once every high-weight
-    /// site is taken, loading falls back to effectively uniform among the
-    /// free plain sites.
-    WeightedSites { weights: Vec<f64> },
 }
 
 impl Spawn for SpawnRule {
@@ -50,33 +44,6 @@ impl Spawn for SpawnRule {
             // a free-site list otherwise.
             SpawnRule::UniformNonCtcf => {
                 let n = world.lattice.len() as u32;
-                loop {
-                    let i = rng.gen_range(0..n);
-                    let kind = world.lattice.sites[i as usize].kind;
-                    if matches!(kind, SiteKind::Plain) && !world.occupied(i) {
-                        return i;
-                    }
-                }
-            }
-            SpawnRule::WeightedSites { weights } => {
-                let n = world.lattice.len() as u32;
-                let max_w = weights.iter().copied().fold(0.0, f64::max);
-                // Cap the attempts so a lattice whose high-weight sites are
-                // all taken (or absent) falls back to uniform placement
-                // instead of spinning.
-                let cap = 100 * world.lattice.len() + 1;
-                for _ in 0..cap {
-                    let i = rng.gen_range(0..n);
-                    let kind = world.lattice.sites[i as usize].kind;
-                    if !matches!(kind, SiteKind::Plain) || world.occupied(i) {
-                        continue;
-                    }
-                    let w = weights.get(i as usize).copied().unwrap_or(0.0);
-                    if w > 0.0 && rng.gen_bool((w / max_w).min(1.0)) {
-                        return i;
-                    }
-                }
-                // Fallback: uniform among free plain sites.
                 loop {
                     let i = rng.gen_range(0..n);
                     let kind = world.lattice.sites[i as usize].kind;
@@ -104,21 +71,118 @@ impl Spawn for SpawnRule {
                 }
                 Ok(())
             }
-            // Same plain-site budget; concentration beyond it degrades to
-            // uniform loading rather than failing.
-            SpawnRule::WeightedSites { .. } => {
-                let needed = (2 * n_lefs).saturating_sub(1);
-                let n_plain = lattice.n_plain();
-                if n_plain < needed {
-                    return Err(SpawnError::NotEnoughSites {
-                        n_lefs,
-                        needed,
-                        n_plain,
-                    });
-                }
-                Ok(())
+        }
+    }
+}
+
+/// Why a [`WeightedSpawn`] can't be built.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum WeightsError {
+    /// The loading ratio must be finite and at least 1.
+    BadRatio(f64),
+    /// A loading site is off the lattice, or on a CTCF site (which never spawns).
+    BadSite(Position),
+}
+
+impl std::fmt::Display for WeightsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WeightsError::BadRatio(r) => write!(f, "loading ratio must be finite and >= 1, got {r}"),
+            WeightsError::BadSite(s) => write!(f, "loading site {s} is off the lattice or a CTCF site"),
+        }
+    }
+}
+
+impl std::error::Error for WeightsError {}
+
+/// A spawn rule with preferential loading sites (e.g. NIPBL loading in the
+/// user's M5_v3 model): every plain site has weight 1, and each site in
+/// `sites` has weight `ratio` (50 reproduces the 0.05-vs-0.001 preference).
+/// Sampling draws a weighted site over the plain ones and redraws while it is
+/// occupied, so the placement *rate* is unchanged — only *where* LEFs land.
+///
+/// Not a [`SpawnRule`], as it carries data; a `Sim` takes it through
+/// [`Sim::with_spawn_extrusion_from`](crate::Sim::with_spawn_extrusion_from).
+#[derive(Clone, Debug, PartialEq)]
+pub struct WeightedSpawn {
+    /// Per-site weight: 0 where no LEF can land, 1 on plain sites, `ratio` on
+    /// loading sites.
+    weights: Vec<f64>,
+    /// Sum of `weights`; the draw range.
+    total: f64,
+}
+
+impl WeightedSpawn {
+    /// Plain sites of a lattice of `n_sites` (CTCFs at `ctcf_sites`) get
+    /// weight 1; each site in `sites` gets weight `ratio`.
+    pub fn loading(
+        n_sites: u32,
+        ctcf_sites: &[Position],
+        sites: &[Position],
+        ratio: f64,
+    ) -> Result<Self, WeightsError> {
+        if !(ratio.is_finite() && ratio >= 1.0) {
+            return Err(WeightsError::BadRatio(ratio));
+        }
+        let mut weights = vec![1.0; n_sites as usize];
+        for &c in ctcf_sites {
+            if let Some(w) = weights.get_mut(c as usize) {
+                *w = 0.0;
             }
         }
+        let mut total = weights.iter().sum();
+        for &s in sites {
+            let w = weights.get_mut(s as usize).ok_or(WeightsError::BadSite(s))?;
+            if *w == 0.0 {
+                return Err(WeightsError::BadSite(s));
+            }
+            if *w == 1.0 {
+                // First time this site is listed; duplicates keep the ratio.
+                total += ratio - 1.0;
+                *w = ratio;
+            }
+        }
+        Ok(Self { weights, total })
+    }
+}
+
+impl Spawn for WeightedSpawn {
+    fn sample(&self, world: &World, rng: &mut SimRng) -> Position {
+        loop {
+            let mut u = rng.gen_range(0.0..self.total);
+            for (i, &w) in self.weights.iter().enumerate() {
+                if w == 0.0 {
+                    continue;
+                }
+                if u < w {
+                    if !world.occupied(i as Position) {
+                        return i as Position;
+                    }
+                    break; // occupied: redraw
+                }
+                u -= w;
+            }
+            // Falling off the end (rounding) also redraws.
+        }
+    }
+
+    fn check(&self, lattice: &Lattice, n_lefs: usize) -> Result<(), SpawnError> {
+        // As UniformNonCtcf, but only plain sites with a positive weight count.
+        let needed = (2 * n_lefs).saturating_sub(1);
+        let n_plain = lattice
+            .sites
+            .iter()
+            .zip(self.weights.iter().chain(std::iter::repeat(&0.0)))
+            .filter(|(s, w)| matches!(s.kind, SiteKind::Plain) && **w > 0.0)
+            .count();
+        if n_plain < needed {
+            return Err(SpawnError::NotEnoughSites {
+                n_lefs,
+                needed,
+                n_plain,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -220,6 +284,62 @@ mod tests {
     }
 
     #[test]
+    fn weighted_spawn_fills_loading_sites_first_reproducibly() {
+        // 1000 plain sites, 10 of them loading at 50x: each draw lands on a
+        // loading site with probability 500 / (990 + 500) ~= 0.34, so the 10
+        // loading sites are snapped up within the first placements.
+        let lattice = Lattice::plain(1000).unwrap();
+        let sites: Vec<Position> = (100..110).collect();
+        let rule = WeightedSpawn::loading(1000, &[], &sites, 50.0).unwrap();
+        let world = populate(lattice.clone(), 200, &rule, 3).unwrap();
+        let hits = world
+            .lef_states()
+            .left_pos
+            .iter()
+            .filter(|&&p| (100..110).contains(&p))
+            .count();
+        assert_eq!(hits, 10, "every loading site should hold a LEF");
+
+        let again = populate(lattice.clone(), 200, &rule, 3).unwrap();
+        assert_eq!(again, world);
+        let other = populate(lattice, 200, &rule, 4).unwrap();
+        assert_ne!(other, world);
+    }
+
+    #[test]
+    fn weighted_spawn_validates_and_checks_capacity() {
+        let ctcf = Ctcf {
+            site: 5,
+            captures_from: Direction::Left,
+            strength: 1.0,
+        };
+        let lattice = Lattice::with_ctcfs(10, &[ctcf]).unwrap();
+        assert_eq!(
+            WeightedSpawn::loading(10, &[5], &[99], 50.0),
+            Err(WeightsError::BadSite(99))
+        );
+        assert_eq!(
+            WeightedSpawn::loading(10, &[5], &[5], 50.0),
+            Err(WeightsError::BadSite(5))
+        );
+        assert_eq!(
+            WeightedSpawn::loading(10, &[5], &[2], 0.5).map(|_| ()),
+            Err(WeightsError::BadRatio(0.5))
+        );
+        // 9 spawnable sites: 5 LEFs need 9 (just fits), 6 need 11.
+        let rule = WeightedSpawn::loading(10, &[5], &[], 50.0).unwrap();
+        assert_eq!(rule.check(&lattice, 5), Ok(()));
+        assert_eq!(
+            rule.check(&lattice, 6),
+            Err(SpawnError::NotEnoughSites {
+                n_lefs: 6,
+                needed: 11,
+                n_plain: 9
+            })
+        );
+    }
+
+    #[test]
     fn populate_places_valid_lefs_reproducibly() {
         let ctcfs: Vec<_> = (0..10)
             .map(|i| Ctcf {
@@ -260,91 +380,6 @@ mod tests {
                 n_lefs: 3,
                 needed: 5,
                 n_plain: 3
-            })
-        );
-    }
-
-    #[test]
-    fn weighted_sites_sample_follows_weights() {
-        use rand::SeedableRng;
-        let n = 100;
-        let mut weights = vec![1.0; n];
-        weights[50] = 50.0; // a single NIPBL-rich hot site
-        let rule = SpawnRule::WeightedSites { weights };
-        // One LEF occupying site 0: 98 free plain sites at weight 1.
-        let mut world = World::new(Lattice::plain(n).unwrap());
-        world
-            .add_lef((0, Mobility::Moving), (0, Mobility::Moving))
-            .unwrap();
-        let mut rng = SimRng::seed_from_u64(11);
-        let trials = 20_000;
-        let mut hits = 0;
-        for _ in 0..trials {
-            if rule.sample(&world, &mut rng) == 50 {
-                hits += 1;
-            }
-        }
-        // Rejection sampling lands on a site with probability ∝ its weight:
-        // P(hot) = 50 / (98 * 1 + 50).
-        let p = 50.0 / 148.0;
-        let frac = hits as f64 / trials as f64;
-        let sigma = (p * (1.0 - p) / trials as f64).sqrt();
-        assert!(
-            (frac - p).abs() < 4.0 * sigma,
-            "hot-site fraction {frac}, want {p} (4σ {sigma:.4})"
-        );
-    }
-
-    #[test]
-    fn weighted_sites_reproduce_and_report_errors() {
-        let n = 1000;
-        let mut weights = vec![1.0; n];
-        for i in [100, 200, 300, 400, 500] {
-            weights[i] = 50.0;
-        }
-        let lattice = Lattice::plain(n).unwrap();
-        let rule = SpawnRule::WeightedSites { weights };
-        assert_eq!(rule.check(&lattice, 20), Ok(()));
-
-        let world = populate(lattice.clone(), 20, &rule, 7).expect("populated");
-        let again = populate(lattice.clone(), 20, &rule, 7).unwrap();
-        assert_eq!(again, world);
-
-        let tight = Lattice::plain(6).unwrap();
-        assert_eq!(
-            rule.check(&tight, 4),
-            Err(SpawnError::NotEnoughSites {
-                n_lefs: 4,
-                needed: 7,
-                n_plain: 6
-            })
-        );
-    }
-
-    #[test]
-    fn weighted_sites_fall_back_when_hot_sites_are_full() {
-        // One hot site, more LEFs than it can hold: the rest load elsewhere
-        // instead of deadlocking.
-        let n = 200;
-        let mut weights = vec![1.0; n];
-        weights[50] = 50.0;
-        let lattice = Lattice::plain(n).unwrap();
-        let rule = SpawnRule::WeightedSites { weights };
-        let world = populate(lattice, 20, &rule, 3).expect("populated");
-        assert_eq!(world.n_lefs(), 20);
-    }
-
-    #[test]
-    fn weighted_sites_check_needs_enough_plain_sites() {
-        let weights = vec![50.0; 6];
-        let lattice = Lattice::plain(6).unwrap();
-        let rule = SpawnRule::WeightedSites { weights };
-        assert_eq!(
-            rule.check(&lattice, 4),
-            Err(SpawnError::NotEnoughSites {
-                n_lefs: 4,
-                needed: 7,
-                n_plain: 6
             })
         );
     }

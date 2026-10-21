@@ -10,7 +10,7 @@ use smallvec::SmallVec;
 
 use super::SimRng;
 use super::action::{Extrusion, land_lef};
-use super::entity::{Lef, LefKey, Leg, LegKey, Mobility};
+use super::entity::{Lef, LefKey, Leg, LegKey, Mobility, Pol2, Rnap, RnapKey};
 use super::lattice::{Direction, Lattice, Position, SiteKind};
 
 /// The state of one leg: where it is and whether it can move.
@@ -138,6 +138,16 @@ pub enum WorldError {
         pos: Position,
         facing: Direction,
     },
+    /// A gene's TSS is outside the lattice. `gene` is its index.
+    GeneOutOfRange { gene: usize, pos: Position, n_sites: usize },
+    /// Two genes share a TSS site. `gene` is the later one's index.
+    GeneSiteTaken { gene: usize, pos: Position },
+    /// A gene's loading rate isn't positive and finite.
+    BadKin { gene: usize, kin: f64 },
+    /// The switch probability isn't in [0, 1].
+    BadSwitchProb { value: f64 },
+    /// The RNAP unloading rate isn't positive and finite.
+    BadOffRate { value: f64 },
 }
 
 impl std::fmt::Display for WorldError {
@@ -175,6 +185,30 @@ impl std::fmt::Display for WorldError {
                 Direction::NAMES[facing.code() as usize].to_lowercase(),
                 Direction::NAMES[facing.code() as usize].to_lowercase(),
             ),
+            WorldError::GeneOutOfRange { gene, pos, n_sites } => {
+                write!(
+                    f,
+                    "gene {gene}: TSS {pos} is outside a lattice of {n_sites} sites"
+                )
+            }
+            WorldError::GeneSiteTaken { gene, pos } => {
+                write!(f, "gene {gene}: TSS {pos} is already another gene's")
+            }
+            WorldError::BadKin { gene, kin } => {
+                write!(f, "gene {gene}: the loading rate must be positive and finite, got {kin}")
+            }
+            WorldError::BadSwitchProb { value } => {
+                write!(
+                    f,
+                    "the switch probability must be in [0, 1], got {value}"
+                )
+            }
+            WorldError::BadOffRate { value } => {
+                write!(
+                    f,
+                    "the RNAP unloading rate must be positive and finite, got {value}"
+                )
+            }
         }
     }
 }
@@ -195,7 +229,7 @@ pub type OccupancyBucket = SmallVec<[LegKey; 2]>;
 /// positions; read through the accessors.
 ///
 /// Two worlds are equal when their lattices and [`LefStates`] are equal,
-/// whatever their internal keys (and CTCF occupancy state).
+/// whatever their internal keys.
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(
@@ -213,12 +247,12 @@ pub struct World {
     pub(crate) lef_order: Vec<LefKey>,
     /// `occupancy[i]` lists the leg(s) currently sitting at site `i`.
     pub(crate) occupancy: Vec<OccupancyBucket>,
-    /// CTCF occupancy under dynamic rates ([`crate::Rates::ctcf_on`]):
-    /// `ctcf_bound[i]` is whether the CTCF at site `i` is bound. Internal
-    /// dynamic state, like the slotmap keys: not part of `PartialEq` and not
-    /// recorded; recordings capture its only observable effect, a released
-    /// leg's changed mobility.
-    pub(crate) ctcf_bound: Vec<bool>,
+    /// The Pol II configuration (empty by default: no Pol II).
+    pub(crate) pol2: Pol2,
+    /// Loaded, stationary RNAPs.
+    pub(crate) rnaps: SlotMap<RnapKey, Rnap>,
+    /// `rnap_at[i]` is the RNAP sitting at site `i`, if any.
+    pub(crate) rnap_at: Vec<Option<RnapKey>>,
 }
 
 impl PartialEq for World {
@@ -237,7 +271,9 @@ impl World {
             lefs: SlotMap::with_key(),
             lef_order: Vec::new(),
             occupancy: vec![OccupancyBucket::new(); n],
-            ctcf_bound: vec![false; n],
+            pol2: Pol2::default(),
+            rnaps: SlotMap::with_key(),
+            rnap_at: vec![None; n],
         }
     }
 
@@ -390,19 +426,81 @@ impl World {
         !self.occupancy[p as usize].is_empty()
     }
 
-    /// Whether the CTCF at `p` is bound, under dynamic CTCF rates. Plain
-    /// sites and unbound CTCFs read `false`; with static rates (`ctcf_on` is
-    /// `None`) this stays all-false and `strength` semantics apply instead.
-    pub fn ctcf_bound(&self, p: Position) -> bool {
-        self.ctcf_bound[p as usize]
-    }
-
-    pub(crate) fn set_ctcf_bound(&mut self, p: Position, bound: bool) {
-        self.ctcf_bound[p as usize] = bound;
-    }
-
     pub fn legs_at(&self, p: Position) -> &[LegKey] {
         &self.occupancy[p as usize]
+    }
+
+    /// The Pol II configuration. Empty means no Pol II: no RNAPs load and
+    /// the dynamics draw no random numbers for them.
+    pub fn pol2(&self) -> &Pol2 {
+        &self.pol2
+    }
+
+    /// Number of loaded RNAPs.
+    pub fn n_rnaps(&self) -> usize {
+        self.rnaps.len()
+    }
+
+    /// The sites of all loaded RNAPs, in no particular order.
+    pub fn rnap_sites(&self) -> Vec<Position> {
+        self.rnaps.values().map(|r| r.pos).collect()
+    }
+
+    /// The RNAP sitting at `p`, if any.
+    pub fn rnap_at(&self, p: Position) -> Option<RnapKey> {
+        self.rnap_at[p as usize]
+    }
+
+    /// Set the Pol II configuration. Checked: gene TSSs on the lattice and
+    /// distinct, positive finite loading rates, a switch probability in
+    /// [0, 1], and (with at least one gene) a positive finite unloading
+    /// rate. An empty gene list leaves the world without Pol II and skips
+    /// the parameter checks.
+    pub fn set_pol2(&mut self, pol2: Pol2) -> Result<(), WorldError> {
+        let n_sites = self.lattice.len();
+        if !pol2.genes.is_empty() {
+            if !(pol2.switch_prob.is_finite() && (0.0..=1.0).contains(&pol2.switch_prob)) {
+                return Err(WorldError::BadSwitchProb {
+                    value: pol2.switch_prob,
+                });
+            }
+            if !(pol2.off.is_finite() && pol2.off > 0.0) {
+                return Err(WorldError::BadOffRate { value: pol2.off });
+            }
+        }
+        let mut seen = Vec::with_capacity(pol2.genes.len());
+        for (gene, g) in pol2.genes.iter().enumerate() {
+            if g.tss as usize >= n_sites {
+                return Err(WorldError::GeneOutOfRange {
+                    gene,
+                    pos: g.tss,
+                    n_sites,
+                });
+            }
+            if seen.contains(&g.tss) {
+                return Err(WorldError::GeneSiteTaken { gene, pos: g.tss });
+            }
+            seen.push(g.tss);
+            if !(g.kin.is_finite() && g.kin > 0.0) {
+                return Err(WorldError::BadKin { gene, kin: g.kin });
+            }
+        }
+        self.pol2 = pol2;
+        Ok(())
+    }
+
+    /// Place a loaded RNAP at `pos`. Caller must ensure the site is free.
+    pub(crate) fn insert_rnap(&mut self, gene: usize, pos: Position) -> RnapKey {
+        let key = self.rnaps.insert(Rnap { pos, gene });
+        self.rnap_at[pos as usize] = Some(key);
+        key
+    }
+
+    /// Remove an RNAP if present, freeing its site.
+    pub(crate) fn remove_rnap(&mut self, key: RnapKey) {
+        if let Some(r) = self.rnaps.remove(key) {
+            self.rnap_at[r.pos as usize] = None;
+        }
     }
 
     /// Construct a new LEF with both legs sitting at `pos` and facing outward.

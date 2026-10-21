@@ -101,7 +101,7 @@
         };
       }
       square.pixels.set(maps.pixels);
-      square.axis = { ctcfs: run.ctcfs, extent: maps.k * maps.bin };
+      square.axis = { ctcfs: run.ctcfs, genes: run.genes, extent: maps.k * maps.bin };
       square.draw();
       return;
     }

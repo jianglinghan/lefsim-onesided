@@ -15,6 +15,7 @@ import {
   DIRECTION,
   type Extrusion,
   type Lattice,
+  type LoadingSites,
   MOBILITY,
   type Model,
   modelFromJson,
@@ -24,9 +25,9 @@ import {
   Sim,
 } from "lefsim";
 
-import { type Frame, setLattice, setLoadings, snapshotOf } from "../render.ts";
+import { type Frame, setLattice, snapshotOf } from "../render.ts";
 
-export const DEFAULT_N_SITES = 3000;
+export const DEFAULT_N_SITES = 4_000;
 export const MIN_SITES = 100;
 export const MAX_SITES = 100_000;
 export const MAX_LEFS = 700;
@@ -37,8 +38,8 @@ const LEFT = DIRECTION.indexOf("Left");
 const MAX_EVENTS_PER_FRAME = 40_000;
 /** Wall-clock time per frame for a view's sampling, in ms; past it, playback slows. */
 const SAMPLE_BUDGET_MS = 10;
-/** The default density of loop extruders: the cr139 orig model's 1 per 50 sites. */
-const LEFS_PER_SITE = 1 / 50;
+/** The default density of loop extruders: 200 per 10,000 sites (the cr139 M5_v3 model). */
+const LEFS_PER_SITE = 200 / 10_000;
 
 /** A CTCF; `left` means it captures from the left (its chevron points left). */
 export interface Ctcf {
@@ -55,21 +56,38 @@ const DEFAULT_LAYOUT: readonly { at: number; left: boolean }[] = [
   { at: 0.75, left: true },
 ];
 
-export const DEFAULT_STRENGTH = 0.8;
 /**
- * The cr139 orig (one-sided) model's rates: effective step 0.5 (pause 0.5),
- * LEF lifetime 200 (uniform death: blocked and held unload at the basal
- * rate, "stall 不延长寿命"), and dynamic CTCFs at the WT arm's occupancy
- * (kon = 1/(Cof*10) with Cof=300, koff = 1e-3, ~25% bound).
+ * The cr139 zoom window (win3730: hg38 chr4:37,300,000–38,100,000) at
+ * 200 bp/site, N=4000 — the region the user's 6×4 figure displays. CTCFs from
+ * m5_v3_staticPol's `cr139.pkl`, keeping only sites inside the window and
+ * rebased by −2990 (the window's left edge in full-region 200 bp units).
+ *
+ * Direction mapping (from the sim's translocator code): its
+ * `CTCF_left_positions` stall the *leftward-moving* leg, so in lefsim terms
+ * they capture legs arriving from the right — `left: false`, drawn `>`, like
+ * the green "CTCF L" track in the user's figures. Its `CTCF_right_positions`
+ * stall the rightward-moving leg — `left: true`, drawn `<`.
  */
-export const DEFAULT_RATES: Readonly<Rates> = {
-  step: 0.5,
-  respawn: 0.005,
-  respawnBlocked: 0.005,
-  respawnCaptured: 0.005,
-  ctcfOn: 1 / 3000,
-  ctcfOff: 0.001,
-};
+const CR139_CTCF_LEFT_POSITIONS =
+  "760 761 762 763 764 765 766 767 768 769 770 1510 1511 1512 1513 1514 1515 1516 1517 1518 1519 1520 2508 2509 2510 2511 2512 2513 2514 2515 2516 2517 2518 2519 2520 3386 3387 3388 3389 3390 3391 3800 3801 3802 3803 3804 3805 3806 3807 3808 3809 3810 3811 3812 3813 3814 3815 3816 3817 3818 3819 3820 3821 3822 3823 3824 3825 3826 3827 3828 3829 3830 3831 3832 3833 3834 3835 3836 3837 3838 3839 3840 3841 3842 3843 3844 3845 3846 3847 3848 3849 3850";
+const CR139_CTCF_RIGHT_POSITIONS =
+  "416 417 418 419 420 421 448 449 450 451 452 453 1331 1332 1333 1334 1335 1336 2460 2461 2462 2463 2464 2465 2466 2467 2468 2469 2470 2508 2509 2510 2511 2512 2513 2514 2515 2516 2517 2518 2519 2520 3380 3381 3382 3383 3384 3385 3386 3387 3388 3389 3390 3673 3674 3675 3676 3677 3678 3679";
+
+/** The five M5_v3 Pol II genes with a TSS inside the zoom window (rebased by −2990). */
+export const CR139_GENES: readonly number[] = [769, 1931, 2633, 2955, 3301];
+
+/** The M5_v3 NIPBL loading sites inside the zoom window (4921–4925, rebased by −2990). */
+export const CR139_LOADING: readonly number[] = [1931, 1932, 1933, 1934, 1935];
+
+function cr139Ctcfs(strength: number): Ctcf[] {
+  const parse = (sites: string, left: boolean) => sites.split(" ").map((s) => ({ site: Number(s), left, strength }));
+  return [...parse(CR139_CTCF_LEFT_POSITIONS, false), ...parse(CR139_CTCF_RIGHT_POSITIONS, true)];
+}
+
+export const DEFAULT_STRENGTH = 1.0;
+/** The M5_v3 rates: pause 0.5 (step 0.5), life 200 (respawn 5e-4); stalling
+ *  never extends lifetime, so all three respawn rates are equal. */
+export const DEFAULT_RATES: Readonly<Rates> = { step: 0.5, respawn: 0.0005, respawnBlocked: 0.0005, respawnCaptured: 0.0005 };
 
 /** A complete setup for a run: what a tour scene loads (see tour/tour.ts). */
 export interface Preset {
@@ -107,13 +125,15 @@ export function maxLefsFor(nSites: number, nCtcfs: number): number {
 }
 
 function defaultCtcfs(nSites: number, strength: number): Ctcf[] {
+  // At the default size the cr139 layout; any other size gets the generic one.
+  if (nSites === DEFAULT_N_SITES) return cr139Ctcfs(strength);
   return DEFAULT_LAYOUT.map((c) => ({ site: Math.round(c.at * (nSites - 1)), left: c.left, strength }));
 }
 
 /** The setup the app opens with, and returns to when the tour finishes. */
 export const DEFAULT_PRESET: Readonly<Preset> = {
   nSites: DEFAULT_N_SITES,
-  nLefs: 20,
+  nLefs: 80,
   ctcfs: defaultCtcfs(DEFAULT_N_SITES, DEFAULT_STRENGTH).map(({ site, left }) => ({ site, left })),
   strength: DEFAULT_STRENGTH,
   rates: DEFAULT_RATES,
@@ -126,12 +146,20 @@ export class Run {
   nSites = $state(DEFAULT_N_SITES);
   nLefs = $state(DEFAULT_PRESET.nLefs);
   seed = $state(DEFAULT_PRESET.seed);
-  /** The extrusion leg-rule: one-sided by default (the cr139 orig model). */
+  /** The extrusion leg-rule: two-sided, or one-sided with anchored legs. */
   extrusion = $state<Extrusion>("one_sided");
-  /** NIPBL loading sites: LEFs load here `loadingBoost` times more than the background. */
-  loadings = $state<number[]>([]);
-  /** How much likelier a loading site is than a background site (0.05/0.001 = 50 in the cr139 model). */
-  loadingBoost = $state(50);
+  /** Pol II genes (TSS sites; all load at `polKin`), empty for no Pol II. */
+  genes = $state<number[]>([...CR139_GENES]);
+  /** The loading rate of every Pol II gene. */
+  polKin = $state(0.001);
+  /** The probability that an active leg meeting an RNAP switches legs. */
+  polSwitch = $state(1);
+  /** The RNAP unloading rate (mean dwell 1/off). */
+  polOff = $state(0.002);
+  /** LEF loading (NIPBL) sites: each is `loadingWeight`x as likely to receive a (re)spawning LEF as a plain site. */
+  loadingSites = $state<number[]>([...CR139_LOADING]);
+  /** A loading site's spawn weight relative to a plain site (50 = the M5_v3 preference). */
+  loadingWeight = $state(50);
   rates = $state<Rates>({ ...DEFAULT_RATES });
   ctcfs = $state<Ctcf[]>(defaultCtcfs(DEFAULT_N_SITES, DEFAULT_STRENGTH));
   /** One strength for every CTCF (`strength`), or each its own. */
@@ -195,36 +223,95 @@ export class Run {
     );
   }
 
-  /** Per-site loading weights from the loading sites, or undefined when none. */
-  #spawnWeight(): Float64Array | undefined {
-    if (!this.loadings.length) return undefined;
-    const w = new Float64Array(this.nSites).fill(1);
-    for (const site of this.loadings) w[site] = this.loadingBoost;
-    return w;
+  /** The Pol II config as a model option, or undefined when gene-less. */
+  pol2Option(): { pol2: NonNullable<Model["pol2"]> } | Record<string, never> {
+    if (!this.genes.length) return {};
+    return {
+      pol2: {
+        genes: this.genes.map((site) => ({ site, kin: this.polKin })),
+        switchProb: this.polSwitch,
+        off: this.polOff,
+      },
+    };
   }
 
-  /** How often a loading site wins a loading, for the readout. */
-  get loadingShare(): number {
-    if (!this.loadings.length) return 0;
-    const boost = this.loadingBoost;
-    const p = this.loadings.length * boost / (this.nSites - this.ctcfs.length + this.loadings.length * (boost - 1));
-    return p;
+  /** Set the Pol II config; restarts the run (placement and RNAPs start over). */
+  setPol2(genes: number[], kin: number, switchProb: number, off: number) {
+    this.genes = genes;
+    this.polKin = kin;
+    this.polSwitch = switchProb;
+    this.polOff = off;
+    this.restart();
+  }
+
+  /** Add a Pol II gene (TSS) at `site`; false if one is there already. */
+  addGene(site: number): boolean {
+    if (this.genes.includes(site)) return false;
+    this.setPol2([...this.genes, site], this.polKin, this.polSwitch, this.polOff);
+    return true;
+  }
+
+  /** Move gene `i` to `site`; false if another gene is there. */
+  moveGene(i: number, site: number): boolean {
+    if (this.genes[i] === site) return true;
+    if (this.genes.includes(site)) return false;
+    const genes = [...this.genes];
+    genes[i] = site;
+    this.setPol2(genes, this.polKin, this.polSwitch, this.polOff);
+    return true;
+  }
+
+  removeGene(i: number) {
+    const genes = [...this.genes];
+    genes.splice(i, 1);
+    this.setPol2(genes, this.polKin, this.polSwitch, this.polOff);
+  }
+
+  /** The loading-sites config as a populate/Sim option, or nothing when empty (uniform = the M5_v3u arm). */
+  loadingOption(): { loading: LoadingSites } | Record<string, never> {
+    if (!this.loadingSites.length) return {};
+    return { loading: { sites: [...this.loadingSites], weight: this.loadingWeight } };
+  }
+
+  /** Set the loading-sites config; restarts the run (placement starts over). */
+  setLoading(sites: number[], weight: number) {
+    this.loadingSites = sites;
+    this.loadingWeight = weight;
+    this.restart();
+  }
+
+  /** Add a loading site at `site`; false if one is there already. */
+  addLoadingSite(site: number): boolean {
+    if (this.loadingSites.includes(site)) return false;
+    this.setLoading([...this.loadingSites, site], this.loadingWeight);
+    return true;
+  }
+
+  /** Move loading site `i` to `site`; false if another is there. */
+  moveLoadingSite(i: number, site: number): boolean {
+    if (this.loadingSites[i] === site) return true;
+    if (this.loadingSites.includes(site)) return false;
+    const sites = [...this.loadingSites];
+    sites[i] = site;
+    this.setLoading(sites, this.loadingWeight);
+    return true;
+  }
+
+  removeLoadingSite(i: number) {
+    const sites = [...this.loadingSites];
+    sites.splice(i, 1);
+    this.setLoading(sites, this.loadingWeight);
   }
 
   /** A new run: the LEFs placed afresh with the seed, on the current model. */
   restart() {
     const lattice = this.lattice();
     this.nLefs = Math.min(Math.max(0, Math.round(this.nLefs)), this.maxLefs);
-    const spawnWeight = this.#spawnWeight();
     this.#start(
       createModel(
-        populate(lattice, this.nLefs, {
-          seed: this.seed,
-          extrusion: this.extrusion,
-          spawnWeight,
-        }),
+        populate(lattice, this.nLefs, { seed: this.seed, extrusion: this.extrusion, ...this.loadingOption() }),
         { ...this.rates },
-        { spawnWeight },
+        this.pol2Option(),
       ),
     );
   }
@@ -239,9 +326,8 @@ export class Run {
     if (this.sim && this.sim.lattice.nSites !== model.world.lattice.nSites) this.#driver = undefined;
     this.sim?.free();
     this.#rebuilds = 0;
-    this.sim = new Sim(model, { seed: this.seed, extrusion: this.extrusion });
-    setLattice(model.world.lattice);
-    setLoadings(this.loadings);
+    this.sim = new Sim(model, { seed: this.seed, extrusion: this.extrusion, ...this.loadingOption() });
+    setLattice(model.world.lattice, this.genes);
     this.#rateWindow = [];
     this.#nextSample = this.sim.time + (this.#driver?.sampleDt ?? 0);
     this.revision++;
@@ -255,7 +341,6 @@ export class Run {
    * if a CTCF that can hold it is still at its site.
    */
   rebuild() {
-    setLoadings(this.loadings);
     const old = this.sim;
     if (!old) return;
     // Copy the state first: the next call into wasm can detach its views.
@@ -294,14 +379,14 @@ export class Run {
 
     const lattice = this.lattice();
     const world = createWorld(lattice, { leftPos, rightPos, leftMobility, rightMobility });
-    const spawnWeight = this.#spawnWeight();
-    this.sim = new Sim(createModel(world, { ...this.rates }, { spawnWeight }), {
+    this.sim = new Sim(createModel(world, { ...this.rates }, this.pol2Option()), {
       seed: this.seed + ++this.#rebuilds,
       startTime: time,
       extrusion: this.extrusion,
+      ...this.loadingOption(),
     });
     old.free();
-    setLattice(lattice);
+    setLattice(lattice, this.genes);
     this.revision++;
     this.#driver?.changed?.("edit");
     this.#publish();
@@ -384,19 +469,10 @@ export class Run {
     this.rebuild();
   }
 
-  /**
-   * Set the rates; a value that isn't positive and finite is ignored. The
-   * dynamic-CTCF rates are the exception: 0 or empty disables them (back to
-   * static `strength` semantics).
-   */
+  /** Set the rates; a value that isn't positive and finite is ignored. */
   setRates(rates: Partial<Rates>) {
     for (const [k, v] of Object.entries(rates) as [keyof Rates, number][]) {
-      if (k === "ctcfOn" || k === "ctcfOff") {
-        if (Number.isFinite(v) && v > 0) this.rates[k] = v;
-        else delete this.rates[k];
-      } else if (Number.isFinite(v) && v > 0) {
-        this.rates[k] = v;
-      }
+      if (Number.isFinite(v) && v > 0) this.rates[k] = v;
     }
     this.rebuild();
   }
@@ -425,62 +501,6 @@ export class Run {
     this.rebuild();
   }
 
-  // ----- loading sites -----
-
-  /** Add a loading site at `site`; false if one is there or a CTCF owns the site. */
-  addLoading(site: number): boolean {
-    site = Math.max(1, Math.min(this.nSites - 2, Math.round(site)));
-    if (this.loadings.includes(site)) return false;
-    if (this.ctcfs.some((c) => c.site === site)) return false;
-    this.loadings.push(site);
-    this.rebuild();
-    return true;
-  }
-
-  /** Add a loading site in the middle of the widest stretch without one, so repeated adds spread evenly. False if no room. */
-  addLoadingEvenly(): boolean {
-    const sorted = [...this.loadings].sort((a, b) => a - b);
-    const edges = [-1, ...sorted, this.nSites];
-    let best = -1;
-    for (let k = 0; k < edges.length - 1; k++) {
-      const gap = edges[k + 1]! - edges[k]!;
-      if (gap >= 2 && (best < 0 || gap > edges[best + 1]! - edges[best]!)) best = k;
-    }
-    if (best < 0) return false;
-    return this.addLoading(Math.floor((edges[best]! + edges[best + 1]!) / 2));
-  }
-
-  /** Remove the most recently added loading site. */
-  removeLastLoading() {
-    if (this.loadings.length) {
-      this.loadings.pop();
-      this.rebuild();
-    }
-  }
-
-  /** Move loading site `i` to `site`; false if another element is there. */
-  moveLoading(i: number, site: number): boolean {
-    site = Math.max(1, Math.min(this.nSites - 2, Math.round(site)));
-    if (this.loadings[i] === site) return true;
-    if (this.loadings.includes(site) || this.ctcfs.some((c) => c.site === site)) return false;
-    this.loadings[i] = site;
-    this.rebuild();
-    return true;
-  }
-
-  removeLoading(i: number) {
-    this.loadings.splice(i, 1);
-    this.rebuild();
-  }
-
-  /** The loading boost; a non-positive or non-finite value is ignored. */
-  setLoadingBoost(v: number) {
-    if (Number.isFinite(v) && v > 0) {
-      this.loadingBoost = v;
-      this.rebuild();
-    }
-  }
-
   /** A new lattice size: the default layout at that size, with LEFs at the default density, run afresh. */
   resize(nSites: number) {
     const n = Math.max(MIN_SITES, Math.min(MAX_SITES, Math.round(nSites)));
@@ -488,8 +508,9 @@ export class Run {
     this.ctcfs = defaultCtcfs(n, this.strength);
     this.strengthLocked = true;
     for (const c of this.ctcfs) c.strength = this.strength;
+    this.genes = this.genes.filter((g) => g >= 1 && g <= n - 2);
+    this.loadingSites = this.loadingSites.filter((s) => s >= 1 && s <= n - 2);
     this.nLefs = Math.max(1, Math.round(n * LEFS_PER_SITE));
-    this.loadings = [];
     this.loaded = undefined;
     this.restart();
   }
@@ -504,7 +525,6 @@ export class Run {
     this.rates = { ...preset.rates };
     this.seed = preset.seed;
     this.speedLog = Math.log10(Math.max(1, preset.speed));
-    this.loadings = [];
     this.loaded = undefined;
     this.restart();
   }
@@ -539,6 +559,8 @@ export class Run {
     if (strengths.length) this.strength = this.strengthLocked ? strengths[0]! : Math.max(...strengths);
     this.nLefs = lefs.leftPos.length;
     this.rates = { ...model.rates };
+    this.genes = []; // model files carry no Pol II config
+    this.loadingSites = []; // nor a loading-sites config
     this.#start(model);
   }
 
@@ -596,7 +618,7 @@ export class Run {
   #publish(now = performance.now()) {
     const sim = this.sim;
     if (!sim) return;
-    const frame = snapshotOf(sim.state());
+    const frame = snapshotOf(sim.state(), sim.rnapState());
     this.frame = frame;
     this.#rateWindow.push({ t: now, events: sim.nEvents });
     while (this.#rateWindow.length > 2 && now - this.#rateWindow[0]!.t > 1000) this.#rateWindow.shift();

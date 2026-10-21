@@ -54,14 +54,6 @@
     if (input.value.trim() !== "" && Number.isFinite(v) && v > 0) run.setRates({ [key]: v });
     else input.value = String(run.rates[key]);
   }
-
-  /** The dynamic-CTCF rates: empty or 0 disables them (rebuild resets the input). */
-  function setCtcfRate(key: "ctcfOn" | "ctcfOff", input: HTMLInputElement) {
-    const v = Number(input.value);
-    if (input.value.trim() !== "" && Number.isFinite(v) && v > 0) run.setRates({ [key]: v });
-    else run.setRates({ [key]: 0 });
-    input.value = String(run.rates[key] ?? "");
-  }
 </script>
 
 <!-- Model files can be dropped anywhere on the shelf. -->
@@ -130,6 +122,8 @@
       <dd>{run.playing ? `${fmtCompact.format(run.eventsPerSecond)} / s` : "–"}</dd>
       <dt>loops held</dt>
       <dd>{run.held} of {run.frame?.held.length ?? 0}</dd>
+      <dt>RNAPs</dt>
+      <dd>{run.frame?.rnaps.length ?? 0} loaded</dd>
     </dl>
     {#if run.playing && run.behind}
       <p class="behind">Falling behind: playing slower than the speed asks.</p>
@@ -297,25 +291,115 @@
         <option value="one_sided" selected={run.extrusion === "one_sided"}>One-sided</option>
       </select>
     </label>
-    <label class="row" title="How much likelier each loading site is than a background site (50 = the cr139 0.05/0.001 ratio). Applies on rebuild.">
-      <span>Loading weight</span>
-      <output class="mono">{run.loadingBoost}×</output>
+    <h3>Pol II</h3>
+    <label class="row" title="Comma-separated TSS sites. Stationary RNAPs load at each TSS, block it, and a one-sided active leg meeting one switches legs (the M5_v3 static rule). Empty disables Pol II.">
+      <span>Gene TSSs</span>
       <input
-        type="range"
-        min="1"
-        max="200"
-        step="1"
-        value={run.loadingBoost}
-        oninput={(e) => run.setLoadingBoost(Number(e.currentTarget.value))}
-        aria-label="Loading weight: how much likelier a loading site is than a background site"
+        class="mono"
+        type="text"
+        placeholder="600, 1300 — empty: no Pol II"
+        value={run.genes.join(", ")}
+        onchange={(e) => {
+          // Extract every integer, whatever the separator (half/full-width
+          // commas, ideographic spaces, pasted text); dedupe and sort.
+          const sites = [
+            ...new Set(
+              (e.currentTarget.value.match(/\d+/g) ?? [])
+                .map(Number)
+                .filter((v) => v < run.nSites),
+            ),
+          ].sort((a, b) => a - b);
+          run.setPol2(sites, run.polKin, run.polSwitch, run.polOff);
+        }}
       />
     </label>
-    <div class="row" title="Loading sites are the red lane under the CTCF lanes: click it to add one, drag to move, drag out to remove.">
+    <p class="hint" class:warn={run.genes.length === 0}>
+      Committed genes: {run.genes.length ? run.genes.join(", ") : "none — press Enter in the field above to apply"}.
+    </p>
+    {#if run.genes.length}
+      <label class="row">
+        <span>Loading rate</span>
+        <input
+          class="mono"
+          type="number"
+          min="0"
+          step="any"
+          value={run.polKin}
+          onchange={(e) => {
+            const v = Number(e.currentTarget.value);
+            if (v > 0) run.setPol2(run.genes, v, run.polSwitch, run.polOff);
+          }}
+        />
+      </label>
+      <label class="row">
+        <span>Switch at RNAP</span>
+        <output class="mono">{run.polSwitch}</output>
+        <input
+          type="range"
+          min="0"
+          max="1"
+          step="0.05"
+          value={run.polSwitch}
+          onchange={(e) => run.setPol2(run.genes, run.polKin, Number(e.currentTarget.value), run.polOff)}
+        />
+      </label>
+      <label class="row">
+        <span>RNAP unload</span>
+        <input
+          class="mono"
+          type="number"
+          min="0"
+          step="any"
+          value={run.polOff}
+          onchange={(e) => {
+            const v = Number(e.currentTarget.value);
+            if (v > 0) run.setPol2(run.genes, run.polKin, run.polSwitch, v);
+          }}
+        />
+      </label>
+      <p class="hint">The RNAP dwell mean is 1/unload. Switch at 1 is the M5_v3 rule.</p>
+    {/if}
+    <h3>LEF loading</h3>
+    <label class="row" title="Comma-separated sites where (re)spawning LEFs preferentially land (NIPBL loading sites). Each is Loading weight times as likely as a plain site. Empty = uniform loading (the M5_v3u arm).">
       <span>Loading sites</span>
-      <output class="mono">{run.loadings.length}</output>
-      <button class="btn" onclick={() => run.addLoadingEvenly()}>Add</button>
-      <button class="btn" onclick={() => run.removeLastLoading()} disabled={!run.loadings.length}>Remove</button>
-    </div>
+      <input
+        class="mono"
+        type="text"
+        placeholder="1931, 1932, … — empty: uniform"
+        value={run.loadingSites.join(", ")}
+        onchange={(e) => {
+          // Same parsing as the gene field: every integer, deduped, sorted.
+          const sites = [
+            ...new Set(
+              (e.currentTarget.value.match(/\d+/g) ?? [])
+                .map(Number)
+                .filter((v) => v < run.nSites),
+            ),
+          ].sort((a, b) => a - b);
+          run.setLoading(sites, run.loadingWeight);
+        }}
+      />
+    </label>
+    <p class="hint" class:warn={run.loadingSites.length === 0}>
+      Committed loading sites: {run.loadingSites.length ? run.loadingSites.join(", ") : "none — uniform loading"}.
+    </p>
+    {#if run.loadingSites.length}
+      <label class="row" title="A loading site's spawn weight relative to a plain site. 50 reproduces the M5_v3 0.05-vs-0.001 preference.">
+        <span>Loading weight</span>
+        <input
+          class="mono"
+          type="number"
+          min="1"
+          step="any"
+          value={run.loadingWeight}
+          onchange={(e) => {
+            const v = Number(e.currentTarget.value);
+            if (v >= 1) run.setLoading(run.loadingSites, v);
+          }}
+        />
+      </label>
+      <p class="hint">50× is the M5_v3 NIPBL preference; empty sites is the M5_v3u arm.</p>
+    {/if}
     <h3>Rates</h3>
     <div class="rates">
       {#each RATE_FIELDS as f (f.key)}
@@ -333,35 +417,6 @@
     </div>
     <p class="hint">
       Rates are events per time unit.
-    </p>
-    <div class="rates">
-      <label for="rate-ctcf-on">CTCF bind (kon)</label>
-      <input
-        id="rate-ctcf-on"
-        class="mono"
-        type="number"
-        min="0"
-        step="any"
-        placeholder="off"
-        value={run.rates.ctcfOn ?? ""}
-        onchange={(e) => setCtcfRate("ctcfOn", e.currentTarget)}
-      />
-      <label for="rate-ctcf-off">CTCF off (koff)</label>
-      <input
-        id="rate-ctcf-off"
-        class="mono"
-        type="number"
-        min="0"
-        step="any"
-        placeholder="off"
-        value={run.rates.ctcfOff ?? ""}
-        onchange={(e) => setCtcfRate("ctcfOff", e.currentTarget)}
-      />
-    </div>
-    <p class="hint">
-      Set both to give CTCFs dynamic occupancy: a bound CTCF (bright chevron) always captures and
-      evicts; an unbound one (faint) does nothing. CTCF off releases held legs. Empty = static
-      strength semantics.
     </p>
   </section>
 
@@ -381,6 +436,10 @@
 />
 
 <style>
+  .warn {
+    color: var(--held);
+  }
+
   section {
     display: flex;
     flex-direction: column;

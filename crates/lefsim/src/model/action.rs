@@ -4,7 +4,7 @@ use rand::Rng;
 use rand::distributions::OpenClosed01;
 use smallvec::SmallVec;
 
-use super::entity::{LefKey, LegKey, Mobility};
+use super::entity::{LefKey, LegKey, Mobility, RnapKey};
 use super::lattice::{Direction, Position, SiteKind};
 use super::spawn::Spawn;
 use super::world::World;
@@ -26,19 +26,6 @@ pub struct Rates {
     /// is doing: capture protects a LEF from faster unloading, and its other
     /// leg from eviction.
     pub respawn_captured: f64,
-    /// CTCF binding rate: how fast an unbound CTCF site binds. `Some` (with
-    /// `ctcf_off`) switches CTCFs to explicit occupancy dynamics: a bound
-    /// CTCF certainly captures from its capture side and certainly evicts
-    /// from its evict side, an unbound one does neither, and `strength` is
-    /// ignored. `None` (default) keeps the static per-encounter `strength`
-    /// semantics. Initial occupancy at sim start is drawn from the
-    /// equilibrium `kon / (kon + koff)`.
-    #[cfg_attr(feature = "serde", serde(default))]
-    pub ctcf_on: Option<f64>,
-    /// CTCF unbinding rate ("drop-off"): a bound CTCF unbinds after a wait at
-    /// this rate and releases any captured leg. See [`Rates::ctcf_on`].
-    #[cfg_attr(feature = "serde", serde(default))]
-    pub ctcf_off: Option<f64>,
 }
 
 impl Default for Rates {
@@ -51,8 +38,6 @@ impl Default for Rates {
             respawn: 1e-3,
             respawn_blocked: 1e-2,
             respawn_captured: 1e-3,
-            ctcf_on: None,
-            ctcf_off: None,
         }
     }
 }
@@ -91,27 +76,32 @@ pub enum Action {
     /// `p = 1` if a captured leg holds it. A leg whose partner is captured is
     /// immune: it passes a bare CTCF at the full rate, and a held one blocks it.
     Evict { leg: LegKey },
-    /// A CTCF site binds (dynamic CTCF rates only, see [`Rates::ctcf_on`]):
-    /// from then on it certainly captures legs landing on its capture side
-    /// and certainly evicts legs meeting its evict side, until it unbinds.
-    CtcfBind { site: Position },
-    /// A bound CTCF unbinds ("drops off") at [`Rates::ctcf_off`], and any leg
-    /// it holds is released. One-sided anchored legs are not CTCF holds:
-    /// they stay anchored.
-    CtcfRelease { site: Position },
+    /// A one-sided LEF's active leg, facing a stationary RNAP, switches legs:
+    /// it anchors where it stands and its anchored partner starts moving.
+    /// Scheduled at `switch_prob * step`; a probability of 1 means the
+    /// encounter always switches, the M5_v3 static-Pol II rule.
+    Switch { leg: LegKey },
+    /// An RNAP loads at its gene's TSS. Scheduled at the gene's `kin` while
+    /// the TSS is free; the load itself checks again, so a raced load is a
+    /// no-op rather than a double occupancy.
+    RnapLoad { gene: usize },
+    /// A loaded RNAP unbinds from its TSS, at the Pol II `off` rate. Stale
+    /// entries (the RNAP already unloaded) reschedule to never.
+    RnapOff { rnap: RnapKey },
 }
 
 impl Action {
     /// Stable `u8` encoding of the variant, used in recorded event frames:
     /// an index into [`crate::EventFrames::KIND_NAMES`] (`Keyframe` holds
-    /// code 2, so `Evict` is 3).
+    /// code 2, so `Evict` is 3; the Pol II actions append 4-6).
     pub fn code(self) -> u8 {
         match self {
             Action::Step { .. } => 0,
             Action::Respawn { .. } => 1,
             Action::Evict { .. } => 3,
-            Action::CtcfBind { .. } => 4,
-            Action::CtcfRelease { .. } => 5,
+            Action::Switch { .. } => 4,
+            Action::RnapLoad { .. } => 5,
+            Action::RnapOff { .. } => 6,
         }
     }
 
@@ -122,8 +112,9 @@ impl Action {
             Action::Step { leg } => schedule_step(leg, world, rates, now, rng),
             Action::Respawn { lef } => schedule_respawn(lef, world, rates, now, rng),
             Action::Evict { leg } => schedule_evict(leg, world, rates, now, rng),
-            Action::CtcfBind { site } => schedule_ctcf_bind(site, world, rates, now, rng),
-            Action::CtcfRelease { site } => schedule_ctcf_release(site, world, rates, now, rng),
+            Action::Switch { leg } => schedule_switch(leg, world, rates, now, rng),
+            Action::RnapLoad { gene } => schedule_rnap_load(gene, world, now, rng),
+            Action::RnapOff { rnap } => schedule_rnap_off(rnap, world, now, rng),
         }
     }
 
@@ -134,18 +125,18 @@ impl Action {
         &self,
         world: &mut World,
         spawn: &dyn Spawn,
-        rates: &Rates,
         extrusion: Extrusion,
         _now: Time,
         rng: &mut SimRng,
         touched: &mut Touched,
     ) {
         match *self {
-            Action::Step { leg } => fire_step(leg, world, rates, extrusion, rng, touched),
+            Action::Step { leg } => fire_step(leg, world, extrusion, rng, touched),
             Action::Respawn { lef } => fire_respawn(lef, world, spawn, extrusion, rng, touched),
             Action::Evict { leg } => fire_evict(leg, world, spawn, extrusion, rng, touched),
-            Action::CtcfBind { site } => fire_ctcf_bind(site, world, touched),
-            Action::CtcfRelease { site } => fire_ctcf_release(site, world, touched),
+            Action::Switch { leg } => fire_switch(leg, world, touched),
+            Action::RnapLoad { gene } => fire_rnap_load(gene, world, touched),
+            Action::RnapOff { rnap } => fire_rnap_off(rnap, world, touched),
         }
     }
 }
@@ -153,17 +144,28 @@ impl Action {
 /// Set of entities mutated by a fired action. The model author pushes
 /// every leg/LEF whose state changed (or whose neighborhood changed in a
 /// way that affects scheduling) into this buffer. The engine then asks
-/// it which actions to reschedule via [`Touched::dependent_actions`].
+/// it which actions to reschedule via [`Touched::dependent_actions`], and
+/// inserts the actions brand-new entities brought into being.
 #[derive(Clone, Default, Debug)]
 pub(crate) struct Touched {
     pub(crate) legs: SmallVec<[LegKey; 8]>,
     pub(crate) lefs: SmallVec<[LefKey; 4]>,
+    /// Genes whose load scheduling may have changed (a load or unload happened).
+    pub(crate) genes: SmallVec<[usize; 4]>,
+    /// RNAPs whose unload scheduling may have changed.
+    pub(crate) rnaps: SmallVec<[RnapKey; 4]>,
+    /// Actions for entities created by the fired action: inserted into the
+    /// heap, not merely rescheduled (they have no entry yet).
+    pub(crate) insert: SmallVec<[Action; 2]>,
 }
 
 impl Touched {
     pub(crate) fn clear(&mut self) {
         self.legs.clear();
         self.lefs.clear();
+        self.genes.clear();
+        self.rnaps.clear();
+        self.insert.clear();
     }
 
     /// The actions to reschedule after `fired` fired: `fired` itself first
@@ -179,6 +181,7 @@ impl Touched {
             [
                 Action::Step { leg: leg_k },
                 Action::Evict { leg: leg_k },
+                Action::Switch { leg: leg_k },
                 Action::Respawn { lef: lef_k },
             ]
         });
@@ -186,12 +189,21 @@ impl Touched {
             .lefs
             .iter()
             .map(|&lef_k| Action::Respawn { lef: lef_k });
+        let from_genes = self.genes.iter().map(|&gene| Action::RnapLoad { gene });
+        let from_rnaps = self
+            .rnaps
+            .iter()
+            .map(|&rnap_k| Action::RnapOff { rnap: rnap_k });
 
         let mut actions: SmallVec<[Action; 32]> = SmallVec::new();
         actions.push(fired);
         // A touched set is small (a handful of entities), so a linear scan
         // beats hashing.
-        for action in from_legs.chain(from_lefs) {
+        for action in from_legs
+            .chain(from_lefs)
+            .chain(from_genes)
+            .chain(from_rnaps)
+        {
             if !actions.contains(&action) {
                 actions.push(action);
             }
@@ -210,27 +222,22 @@ enum Ahead {
     Free,
     /// An empty CTCF met from behind (its capture side faces away from the
     /// leg), with this strength, the chance it's bound: the leg passes onto
-    /// it or is evicted by it, competing. Static rates only.
+    /// it or is evicted by it, competing.
     CtcfBack(f64),
     /// A CTCF met from behind and holding a captured leg: bound for certain,
     /// so the leg can only be evicted.
     CtcfBackHeld,
-    /// A bound CTCF met from behind under dynamic rates: eviction is certain
-    /// while it stays bound.
-    CtcfBackBound,
+    /// A loaded, stationary RNAP: the leg can't step onto it; a one-sided
+    /// active leg may switch legs instead.
+    RnapOccupied,
     /// Any other leg, or the lattice's end: the leg can't step.
     Blocked,
-}
-
-/// Whether CTCF occupancy is dynamic ([`Rates::ctcf_on`] set).
-fn dynamic_ctcfs(rates: &Rates) -> bool {
-    rates.ctcf_on.is_some()
 }
 
 /// What's ahead of `leg_k`. A leg captured on a CTCF always faces back
 /// toward the CTCF's other side, so a captured leg ahead on a CTCF met from
 /// behind is exactly a held CTCF; any other leg ahead is traffic.
-fn ahead(world: &World, rates: &Rates, leg_k: LegKey) -> Ahead {
+fn ahead(world: &World, leg_k: LegKey) -> Ahead {
     let leg = &world.legs[leg_k];
     let Some(target) = leg
         .facing
@@ -239,6 +246,9 @@ fn ahead(world: &World, rates: &Rates, leg_k: LegKey) -> Ahead {
     else {
         return Ahead::Blocked;
     };
+    if world.rnap_at(target).is_some() {
+        return Ahead::RnapOccupied;
+    }
     let back = match world.lattice.sites[target as usize].kind {
         SiteKind::Ctcf {
             captures_from,
@@ -248,18 +258,6 @@ fn ahead(world: &World, rates: &Rates, leg_k: LegKey) -> Ahead {
     };
     let occupants = world.legs_at(target);
     match back {
-        Some(_) if dynamic_ctcfs(rates) => {
-            if occupants
-                .iter()
-                .any(|&o| world.legs[o].mobility == Mobility::Captured)
-            {
-                Ahead::CtcfBackHeld
-            } else if world.ctcf_bound(target) {
-                Ahead::CtcfBackBound
-            } else {
-                Ahead::Free
-            }
-        }
         Some(strength) if occupants.is_empty() => Ahead::CtcfBack(strength),
         Some(_)
             if occupants
@@ -282,14 +280,14 @@ fn protected(world: &World, leg_k: LegKey) -> bool {
 }
 
 /// Whether a leg is blocked: moving, but unable to step or be evicted (a leg
-/// ahead, or the lattice's end; for a protected leg, also a held CTCF met
-/// from behind). Derived from positions, never stored, so it can't go stale
-/// as neighbors move.
-fn blocked(world: &World, rates: &Rates, leg_k: LegKey) -> bool {
+/// ahead, a stationary RNAP, or the lattice's end; for a protected leg, also
+/// a held CTCF met from behind). Derived from positions, never stored, so it
+/// can't go stale as neighbors move.
+fn blocked(world: &World, leg_k: LegKey) -> bool {
     world.legs[leg_k].mobility == Mobility::Moving
-        && match ahead(world, rates, leg_k) {
-            Ahead::Blocked => true,
-            Ahead::CtcfBackHeld | Ahead::CtcfBackBound => protected(world, leg_k),
+        && match ahead(world, leg_k) {
+            Ahead::Blocked | Ahead::RnapOccupied => true,
+            Ahead::CtcfBackHeld => protected(world, leg_k),
             Ahead::Free | Ahead::CtcfBack(_) => false,
         }
 }
@@ -313,13 +311,13 @@ fn schedule_step(
     if world.legs[leg_k].mobility != Mobility::Moving {
         return Schedule::Never;
     }
-    match ahead(world, rates, leg_k) {
+    match ahead(world, leg_k) {
         Ahead::Free => at_rate(rates.step, now, rng),
         // Immune to eviction: it just steps on.
         Ahead::CtcfBack(_) if protected(world, leg_k) => at_rate(rates.step, now, rng),
         // Passing: the CTCF turns out unbound.
         Ahead::CtcfBack(strength) => at_rate((1.0 - strength) * rates.step, now, rng),
-        Ahead::CtcfBackHeld | Ahead::CtcfBackBound | Ahead::Blocked => Schedule::Never,
+        Ahead::CtcfBackHeld | Ahead::Blocked | Ahead::RnapOccupied => Schedule::Never,
     }
 }
 
@@ -333,39 +331,59 @@ fn schedule_evict(
     if world.legs[leg_k].mobility != Mobility::Moving || protected(world, leg_k) {
         return Schedule::Never;
     }
-    match ahead(world, rates, leg_k) {
+    match ahead(world, leg_k) {
         // The CTCF turns out bound...
         Ahead::CtcfBack(strength) => at_rate(strength * rates.step, now, rng),
         // ...or is, for certain.
-        Ahead::CtcfBackHeld | Ahead::CtcfBackBound => at_rate(rates.step, now, rng),
-        Ahead::Free | Ahead::Blocked => Schedule::Never,
+        Ahead::CtcfBackHeld => at_rate(rates.step, now, rng),
+        Ahead::Free | Ahead::Blocked | Ahead::RnapOccupied => Schedule::Never,
     }
 }
 
-fn schedule_ctcf_bind(
-    site: Position,
+/// A one-sided active leg facing a stationary RNAP switches legs at
+/// `switch_prob * step`. Probability 0 (the default) short-circuits before
+/// any random draw, so Pol II-free models follow their original trajectories
+/// bit for bit.
+fn schedule_switch(
+    leg_k: LegKey,
     world: &World,
     rates: &Rates,
     now: Time,
     rng: &mut SimRng,
 ) -> Schedule {
-    match (rates.ctcf_on, world.ctcf_bound(site)) {
-        (Some(kon), false) => at_rate(kon, now, rng),
+    let p = world.pol2.switch_prob;
+    if p == 0.0 || world.legs[leg_k].mobility != Mobility::Moving {
+        return Schedule::Never;
+    }
+    // The switch hands extrusion to the partner: only a one-sided LEF (an
+    // anchored partner) can switch.
+    let partner = world.legs[leg_k].partner;
+    if world.legs[partner].mobility != Mobility::Anchored {
+        return Schedule::Never;
+    }
+    match ahead(world, leg_k) {
+        Ahead::RnapOccupied => at_rate(p * rates.step, now, rng),
         _ => Schedule::Never,
     }
 }
 
-fn schedule_ctcf_release(
-    site: Position,
-    world: &World,
-    rates: &Rates,
-    now: Time,
-    rng: &mut SimRng,
-) -> Schedule {
-    match (rates.ctcf_off, world.ctcf_bound(site)) {
-        (Some(koff), true) => at_rate(koff, now, rng),
-        _ => Schedule::Never,
+/// An RNAP loads at its gene's TSS at the gene's `kin` rate, while the TSS
+/// holds no RNAP and no leg.
+fn schedule_rnap_load(gene: usize, world: &World, now: Time, rng: &mut SimRng) -> Schedule {
+    let tss = world.pol2.genes[gene].tss;
+    if world.rnap_at(tss).is_some() || world.occupied(tss) {
+        return Schedule::Never;
     }
+    at_rate(world.pol2.genes[gene].kin, now, rng)
+}
+
+/// A loaded RNAP unbinds at the Pol II `off` rate. Stale keys (the RNAP
+/// already unloaded, its heap entry superseded) never fire again.
+fn schedule_rnap_off(rnap_k: RnapKey, world: &World, now: Time, rng: &mut SimRng) -> Schedule {
+    if world.rnaps.get(rnap_k).is_none() {
+        return Schedule::Never;
+    }
+    at_rate(world.pol2.off, now, rng)
 }
 
 fn schedule_respawn(
@@ -388,7 +406,7 @@ fn respawn_rate(lef_k: LefKey, world: &World, rates: &Rates) -> f64 {
         .any(|&l| world.legs[l].mobility == Mobility::Captured)
     {
         rates.respawn_captured
-    } else if legs.iter().any(|&l| blocked(world, rates, l)) {
+    } else if legs.iter().any(|&l| blocked(world, l)) {
         rates.respawn_blocked
     } else {
         rates.respawn
@@ -400,7 +418,6 @@ fn respawn_rate(lef_k: LefKey, world: &World, rates: &Rates) -> f64 {
 fn fire_step(
     leg_k: LegKey,
     world: &mut World,
-    rates: &Rates,
     extrusion: Extrusion,
     rng: &mut SimRng,
     touched: &mut Touched,
@@ -436,24 +453,10 @@ fn fire_step(
     world.insert_leg(leg_k, new_pos);
     let kind = world.lattice.sites[new_pos as usize].kind;
     let arrived_from = facing.opposite();
-    // Decide the landing before borrowing the leg mutably.
-    let captured_on_landing = dynamic_ctcfs(rates)
-        && matches!(kind, SiteKind::Ctcf { captures_from, .. } if arrived_from == captures_from)
-        && world.ctcf_bound(new_pos);
     let (mobility, switched) = {
         let leg = &mut world.legs[leg_k];
         leg.pos = new_pos;
-        leg.mobility = if dynamic_ctcfs(rates) {
-            // Occupancy is explicit: a bound CTCF captures from its capture
-            // side, an unbound one passes legs through.
-            if captured_on_landing {
-                Mobility::Captured
-            } else {
-                Mobility::Moving
-            }
-        } else {
-            resolve_mobility(kind, arrived_from, rng)
-        };
+        leg.mobility = resolve_mobility(kind, arrived_from, rng);
         // One-sided: a capture anchors the leg at the CTCF and hands
         // extrusion to the partner, rather than holding the leg there.
         let switched =
@@ -486,53 +489,6 @@ fn fire_step(
             .chain(post_neighbors)
             .filter(|&n| n != leg_k),
     );
-}
-
-/// Neighbors of `site` whose clocks depend on the CTCF there: a leg directly
-/// on either side, facing it (its step/eviction clocks flip with occupancy).
-fn touch_ctcf_neighbors(site: Position, world: &World, touched: &mut Touched) {
-    for n in world.legs_at(site) {
-        touched.legs.push(*n);
-    }
-    for d in [Direction::Left, Direction::Right] {
-        if let Some(p) = d.shift(site)
-            && (p as usize) < world.lattice.len()
-        {
-            for &n in world.legs_at(p) {
-                touched.legs.push(n);
-            }
-        }
-    }
-}
-
-/// A CTCF binds: legs meeting it now face a bound barrier.
-fn fire_ctcf_bind(site: Position, world: &mut World, touched: &mut Touched) {
-    world.set_ctcf_bound(site, true);
-    touch_ctcf_neighbors(site, world, touched);
-}
-
-/// A CTCF unbinds: any captured leg it holds is released (one-sided anchored
-/// legs are not holds and stay anchored), and legs meeting it now pass.
-fn fire_ctcf_release(site: Position, world: &mut World, touched: &mut Touched) {
-    world.set_ctcf_bound(site, false);
-    let occupants: SmallVec<[LegKey; 2]> = world.legs_at(site).to_vec().into();
-    for leg in occupants {
-        if world.legs[leg].mobility != Mobility::Captured {
-            continue;
-        }
-        world.legs[leg].mobility = Mobility::Moving;
-        touched.legs.push(leg);
-        let lef = world.legs[leg].lef;
-        touched.lefs.push(lef);
-        // The partner's eviction immunity came from this capture.
-        let partner = world.lefs[lef]
-            .legs
-            .into_iter()
-            .find(|&l| l != leg)
-            .expect("a leg has a partner");
-        touched.legs.push(partner);
-    }
-    touch_ctcf_neighbors(site, world, touched);
 }
 
 /// Eviction: the LEF unloads at once, respawning in the same event, so no
@@ -608,6 +564,62 @@ fn fire_respawn(
 
     touched.legs.extend([l1, l2]);
     touched.lefs.push(lef_k);
+}
+
+/// The M5_v3 static-Pol II rule: a one-sided LEF's active leg, facing a
+/// stationary RNAP, anchors where it stands and hands extrusion to its
+/// partner (which becomes the moving leg).
+fn fire_switch(leg_k: LegKey, world: &mut World, touched: &mut Touched) {
+    let lef_k = world.legs[leg_k].lef;
+    let partner = world.legs[leg_k].partner;
+    debug_assert!(
+        world.legs[leg_k].mobility == Mobility::Moving
+            && world.legs[partner].mobility == Mobility::Anchored,
+        "switch scheduled for a leg whose partner isn't anchored"
+    );
+    world.legs[leg_k].mobility = Mobility::Anchored;
+    world.legs[partner].mobility = Mobility::Moving;
+    touched.legs.extend([leg_k, partner]);
+    touched.lefs.push(lef_k);
+}
+
+/// Load an RNAP at its gene's TSS. The single event loop makes the scheduler
+/// race-free, but the load re-checks: a LEF sitting on the TSS when this
+/// fires makes it a no-op. Neighboring legs are touched: the RNAP blocks
+/// their steps and may arm their switch.
+fn fire_rnap_load(gene: usize, world: &mut World, touched: &mut Touched) {
+    let tss = world.pol2.genes[gene].tss;
+    if world.rnap_at(tss).is_none() && !world.occupied(tss) {
+        let rnap_k = world.insert_rnap(gene, tss);
+        touched.insert.push(Action::RnapOff { rnap: rnap_k });
+        for d in [Direction::Left, Direction::Right] {
+            if let Some(np) = d.shift(tss)
+                && (np as usize) < world.lattice.len()
+            {
+                touched.legs.extend(world.legs_at(np).iter().copied());
+            }
+        }
+    }
+    touched.genes.push(gene);
+}
+
+/// Unload an RNAP, freeing its TSS for the next load. Stale keys (the RNAP
+/// already unloaded) are no-ops; the entry then reschedules to never.
+/// Neighboring legs are touched: their steps unblock and switches disarm.
+fn fire_rnap_off(rnap_k: RnapKey, world: &mut World, touched: &mut Touched) {
+    let Some(rnap) = world.rnaps.get(rnap_k).copied() else {
+        return;
+    };
+    world.remove_rnap(rnap_k);
+    for d in [Direction::Left, Direction::Right] {
+        if let Some(np) = d.shift(rnap.pos)
+            && (np as usize) < world.lattice.len()
+        {
+            touched.legs.extend(world.legs_at(np).iter().copied());
+        }
+    }
+    touched.genes.push(rnap.gene);
+    touched.rnaps.push(rnap_k);
 }
 
 /// Sample an exponential dt with the given rate (events per unit time).
@@ -705,8 +717,8 @@ pub(crate) fn resolve_mobility(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Lattice, SpawnRule};
-    use Mobility::Moving;
+    use crate::model::{Gene, Lattice, Pol2, SpawnRule, WorldError};
+    use Mobility::{Anchored, Moving};
     use rand::SeedableRng;
 
     #[test]
@@ -726,8 +738,10 @@ mod tests {
                 fired,
                 Action::Step { leg: left },
                 Action::Evict { leg: left },
+                Action::Switch { leg: left },
                 Action::Step { leg: right },
-                Action::Evict { leg: right }
+                Action::Evict { leg: right },
+                Action::Switch { leg: right }
             ]
         );
     }
@@ -738,8 +752,6 @@ mod tests {
         respawn: 1.0,
         respawn_blocked: 2.0,
         respawn_captured: 3.0,
-        ctcf_on: None,
-        ctcf_off: None,
     };
 
     /// A LEF as `((left_pos, mobility), (right_pos, mobility))`.
@@ -863,7 +875,7 @@ mod tests {
             world_with(&[((25, Moving), (27, Moving)), ((26, Moving), (26, Moving))]);
         let behind = world.lefs[keys[1]].legs[0];
         assert_eq!(clocks(&world, behind), (false, false));
-        assert!(blocked(&world, &RATES, behind));
+        assert!(blocked(&world, behind));
         // A leg at the lattice's end: neither.
         let (world, keys) = world_with(&[((30, Moving), (39, Moving))]);
         assert_eq!(clocks(&world, world.lefs[keys[0]].legs[1]), (false, false));
@@ -902,7 +914,7 @@ mod tests {
         ]);
         let leg = world.lefs[keys[1]].legs[0];
         assert_eq!(clocks(&world, leg), (false, false));
-        assert!(blocked(&world, &RATES, leg));
+        assert!(blocked(&world, leg));
     }
 
     #[test]
@@ -915,7 +927,6 @@ mod tests {
         fire_step(
             right,
             &mut world,
-            &RATES,
             Extrusion::TwoSided,
             &mut SimRng::seed_from_u64(0),
             &mut touched,
@@ -991,7 +1002,6 @@ mod tests {
         fire_step(
             leg,
             &mut world,
-            &RATES,
             Extrusion::TwoSided,
             &mut rng,
             &mut Touched::default(),
@@ -1126,7 +1136,6 @@ mod tests {
         fire_step(
             right,
             &mut world,
-            &RATES,
             Extrusion::OneSided,
             &mut SimRng::seed_from_u64(0),
             &mut touched,
@@ -1154,7 +1163,6 @@ mod tests {
         fire_step(
             right,
             &mut world,
-            &RATES,
             Extrusion::OneSided,
             &mut SimRng::seed_from_u64(0),
             &mut Touched::default(),
@@ -1176,142 +1184,11 @@ mod tests {
         let anchored = world.lefs[keys[0]].legs[0];
         // No step, no eviction, and not "blocked": passive, not stuck.
         assert_eq!(clocks(&world, anchored), (false, false));
-        assert!(!blocked(&world, &RATES, anchored));
+        assert!(!blocked(&world, anchored));
         // No capture protection: the LEF unloads at the basal rate.
         assert_eq!(respawn_rate(keys[0], &world, &RATES), RATES.respawn);
         // The anchored leg still occupies its site as traffic.
         assert!(world.occupied(5));
-    }
-
-    // ----- dynamic CTCFs (kon/koff occupancy) -----
-
-    /// Rates with dynamic CTCFs: fast binding, slow unbinding.
-    const DYN_RATES: Rates = Rates {
-        step: 1.0,
-        respawn: 1.0,
-        respawn_blocked: 2.0,
-        respawn_captured: 3.0,
-        ctcf_on: Some(1.0),
-        ctcf_off: Some(0.01),
-    };
-
-    #[test]
-    fn dynamic_bound_ctcf_captures_and_unbound_passes() {
-        use Mobility::Captured;
-        // The right leg at 24 steps onto the CTCF at 25 (strength 0: with
-        // static rates this would certainly pass).
-        let (mut world, keys) = world_on(lattice(0.0), &[((21, Moving), (24, Moving))]);
-        let [_, right] = world.lefs[keys[0]].legs;
-
-        // Unbound: passes through, no capture roll.
-        world.set_ctcf_bound(25, false);
-        fire_step(
-            right,
-            &mut world,
-            &DYN_RATES,
-            Extrusion::TwoSided,
-            &mut SimRng::seed_from_u64(0),
-            &mut Touched::default(),
-        );
-        assert_eq!(
-            (world.legs[right].pos, world.legs[right].mobility),
-            (25, Mobility::Moving)
-        );
-
-        // Bound: captured for certain, even at strength 0.
-        let (mut world, keys) = world_on(lattice(0.0), &[((21, Moving), (24, Moving))]);
-        let [_, right] = world.lefs[keys[0]].legs;
-        world.set_ctcf_bound(25, true);
-        fire_step(
-            right,
-            &mut world,
-            &DYN_RATES,
-            Extrusion::TwoSided,
-            &mut SimRng::seed_from_u64(0),
-            &mut Touched::default(),
-        );
-        assert_eq!(world.legs[right].mobility, Captured);
-    }
-
-    #[test]
-    fn dynamic_eviction_is_certain_while_bound() {
-        // The left leg at 26 faces the CTCF at 25 from behind: with the CTCF
-        // bound, only eviction is scheduled; unbound, only the step.
-        let dyn_clocks = |world: &World, leg: LegKey| {
-            let scheduled = |action: Action| {
-                matches!(
-                    action.schedule(world, &DYN_RATES, 0.0, &mut SimRng::seed_from_u64(0)),
-                    Schedule::At(_)
-                )
-            };
-            (
-                scheduled(Action::Step { leg }),
-                scheduled(Action::Evict { leg }),
-            )
-        };
-        let (world, keys) = world_with(&[((26, Moving), (30, Moving))]);
-        let leg = world.lefs[keys[0]].legs[0];
-        let mut bound = world.clone();
-        bound.set_ctcf_bound(25, true);
-        assert_eq!(dyn_clocks(&bound, leg), (false, true));
-        let mut unbound = world;
-        unbound.set_ctcf_bound(25, false);
-        assert_eq!(dyn_clocks(&unbound, leg), (true, false));
-    }
-
-    #[test]
-    fn releasing_a_ctcf_frees_its_captured_leg() {
-        use Mobility::Captured;
-        let (mut world, _) = world_with(&[((21, Moving), (25, Captured))]);
-        let right = world.lefs[world.lef_order[0]].legs[1];
-        let left = world.lefs[world.lef_order[0]].legs[0];
-        world.set_ctcf_bound(25, true);
-        let mut touched = Touched::default();
-        fire_ctcf_release(25, &mut world, &mut touched);
-        assert!(!world.ctcf_bound(25));
-        assert_eq!(world.legs[right].mobility, Mobility::Moving);
-        assert!(touched.legs.contains(&left), "the partner's clocks changed");
-        // A one-sided anchored leg on the CTCF is not a hold: it stays.
-        let (mut world, keys) = world_with(&[((21, Moving), (25, Mobility::Anchored))]);
-        world.set_ctcf_bound(25, true);
-        fire_ctcf_release(25, &mut world, &mut Touched::default());
-        assert_eq!(world.legs[world.lefs[keys[0]].legs[1]].mobility, Mobility::Anchored);
-    }
-
-    #[test]
-    fn ctcf_bind_and_release_reschedule_each_other() {
-        let mut world = World::new(lattice(1.0));
-        world.set_ctcf_bound(20, false);
-        let mut rng = SimRng::seed_from_u64(0);
-        let bind = Action::CtcfBind { site: 20 }.schedule(&world, &DYN_RATES, 0.0, &mut rng);
-        let release = Action::CtcfRelease { site: 20 }.schedule(&world, &DYN_RATES, 0.0, &mut rng);
-        assert!(matches!(bind, Schedule::At(_)), "unbound CTCF binds at kon");
-        assert!(matches!(release, Schedule::Never), "unbound CTCF has no off clock");
-        world.set_ctcf_bound(20, true);
-        let mut rng = SimRng::seed_from_u64(0);
-        let bind = Action::CtcfBind { site: 20 }.schedule(&world, &DYN_RATES, 0.0, &mut rng);
-        let release = Action::CtcfRelease { site: 20 }.schedule(&world, &DYN_RATES, 0.0, &mut rng);
-        assert!(matches!(bind, Schedule::Never));
-        assert!(matches!(release, Schedule::At(_)), "bound CTCF unbinds at koff");
-    }
-
-    #[test]
-    fn engine_draws_initial_occupancy_from_equilibrium() {
-        use crate::model::{Rates, Site};
-        use crate::sim::engine::Engine;
-        // kon >> koff: essentially every CTCF starts bound.
-        let rates = Rates {
-            ctcf_on: Some(1e6),
-            ctcf_off: Some(1.0),
-            ..Rates::default()
-        };
-        let mut sites = vec![Site::plain(); 50];
-        sites[10] = Site::ctcf(Direction::Left, 0.5);
-        sites[40] = Site::ctcf(Direction::Right, 0.5);
-        let mut world = World::new(Lattice::new(sites).unwrap());
-        let mut engine = Engine::new(rates, Extrusion::TwoSided, 0.0);
-        engine.initialize(&mut world, &mut SimRng::seed_from_u64(3));
-        assert!(world.ctcf_bound(10) && world.ctcf_bound(40));
     }
 
     #[test]
@@ -1334,5 +1211,159 @@ mod tests {
             "expected one Moving and one Anchored after respawn, got [{l:?}, {r:?}]"
         );
         assert_eq!(world.legs[left].pos, world.legs[right].pos);
+    }
+
+    // ----- Pol II: static RNAPs and the M5_v3 switch -----
+
+    /// A plain 40-site world with a one-sided LEF and one Pol II gene.
+    fn pol2_world(lef: LefSpec, tss: u32, kin: f64, switch_prob: f64) -> (World, Vec<LefKey>) {
+        let (mut world, keys) = world_on(Lattice::plain(40).unwrap(), &[lef]);
+        world
+            .set_pol2(Pol2 {
+                genes: vec![Gene { tss, kin }],
+                switch_prob,
+                off: 0.5,
+            })
+            .unwrap();
+        (world, keys)
+    }
+
+    #[test]
+    fn pol2_validation() {
+        let mut world = World::new(Lattice::plain(20).unwrap());
+        let bad = Pol2 {
+            genes: vec![Gene { tss: 30, kin: 1.0 }],
+            switch_prob: 1.0,
+            off: 0.5,
+        };
+        assert!(matches!(
+            world.set_pol2(bad),
+            Err(WorldError::GeneOutOfRange { .. })
+        ));
+        let bad = Pol2 {
+            genes: vec![
+                Gene { tss: 5, kin: 1.0 },
+                Gene { tss: 5, kin: 1.0 },
+            ],
+            switch_prob: 1.0,
+            off: 0.5,
+        };
+        assert!(matches!(
+            world.set_pol2(bad),
+            Err(WorldError::GeneSiteTaken { .. })
+        ));
+        let bad = Pol2 {
+            genes: vec![Gene { tss: 5, kin: f64::NAN }],
+            switch_prob: 1.0,
+            off: 0.5,
+        };
+        assert!(matches!(world.set_pol2(bad), Err(WorldError::BadKin { .. })));
+        let bad = Pol2 {
+            genes: vec![Gene { tss: 5, kin: 1.0 }],
+            switch_prob: 1.5,
+            off: 0.5,
+        };
+        assert!(matches!(
+            world.set_pol2(bad),
+            Err(WorldError::BadSwitchProb { .. })
+        ));
+        let bad = Pol2 {
+            genes: vec![Gene { tss: 5, kin: 1.0 }],
+            switch_prob: 1.0,
+            off: 0.0,
+        };
+        assert!(matches!(
+            world.set_pol2(bad),
+            Err(WorldError::BadOffRate { .. })
+        ));
+        // Empty is always fine.
+        world.set_pol2(Pol2::default()).unwrap();
+    }
+
+    #[test]
+    fn rnap_loads_at_kin_and_blocks_its_tss() {
+        let (mut world, keys) = pol2_world(((5, Anchored), (9, Moving)), 10, 2.0, 1.0);
+        let mut rng = SimRng::seed_from_u64(0);
+        assert!(matches!(
+            Action::RnapLoad { gene: 0 }.schedule(&world, &RATES, 0.0, &mut rng),
+            Schedule::At(_)
+        ));
+        let mut touched = Touched::default();
+        fire_rnap_load(0, &mut world, &mut touched);
+        assert_eq!(world.n_rnaps(), 1);
+        assert!(world.rnap_at(10).is_some());
+        // Loaded: the load never reschedules, and the TSS blocks a leg ahead.
+        assert!(matches!(
+            Action::RnapLoad { gene: 0 }.schedule(&world, &RATES, 0.0, &mut rng),
+            Schedule::Never
+        ));
+        // The new RNAP's unload action is queued for heap insertion.
+        assert!(touched
+            .insert
+            .contains(&Action::RnapOff { rnap: world.rnap_at(10).unwrap() }));
+        // The leg at 9, moving right, now faces the RNAP: no step, a switch.
+        let leg = world.lefs[keys[0]].legs[1];
+        assert_eq!(clocks(&world, leg), (false, false));
+        assert!(matches!(
+            Action::Switch { leg }.schedule(&world, &RATES, 0.0, &mut rng),
+            Schedule::At(_)
+        ));
+    }
+
+    #[test]
+    fn rnap_load_is_a_no_op_when_a_leg_sits_on_the_tss() {
+        let (mut world, _) = pol2_world(((8, Anchored), (10, Moving)), 10, 2.0, 1.0);
+        let mut touched = Touched::default();
+        fire_rnap_load(0, &mut world, &mut touched);
+        assert_eq!(world.n_rnaps(), 0, "a leg on the TSS blocks the load");
+    }
+
+    #[test]
+    fn rnap_off_unloads_and_rearms_the_gene() {
+        let (mut world, _) = pol2_world(((5, Anchored), (8, Moving)), 10, 2.0, 1.0);
+        fire_rnap_load(0, &mut world, &mut Touched::default());
+        let rnap_k = world.rnap_at(10).unwrap();
+        let mut touched = Touched::default();
+        fire_rnap_off(rnap_k, &mut world, &mut touched);
+        assert_eq!(world.n_rnaps(), 0);
+        assert!(world.rnap_at(10).is_none());
+        // The gene may load again; the stale key never fires again.
+        assert!(touched.genes.contains(&0));
+        assert!(touched.rnaps.contains(&rnap_k));
+        let mut rng = SimRng::seed_from_u64(0);
+        assert!(matches!(
+            Action::RnapOff { rnap: rnap_k }.schedule(&world, &RATES, 0.0, &mut rng),
+            Schedule::Never
+        ));
+        assert!(matches!(
+            Action::RnapLoad { gene: 0 }.schedule(&world, &RATES, 0.0, &mut rng),
+            Schedule::At(_)
+        ));
+    }
+
+    #[test]
+    fn an_rnap_encounter_switches_a_one_sided_lef() {
+        use Mobility::{Anchored, Moving};
+        // The right leg at 9 walks toward the RNAP at 10: switch.
+        let (mut world, keys) = pol2_world(((5, Anchored), (9, Moving)), 10, 2.0, 1.0);
+        fire_rnap_load(0, &mut world, &mut Touched::default());
+        let [left, right] = world.lefs[keys[0]].legs;
+        let mut touched = Touched::default();
+        fire_switch(right, &mut world, &mut touched);
+        assert_eq!((world.legs[right].mobility, world.legs[left].mobility), (Anchored, Moving));
+        assert!(touched.legs.contains(&left));
+        // The leg at 9 now anchors; the loop grows leftward from 5.
+        assert_eq!(world.legs[right].pos, 9);
+    }
+
+    #[test]
+    fn switch_prob_zero_disarms_the_encounter() {
+        let (world, keys) = pol2_world(((5, Anchored), (9, Moving)), 10, 2.0, 0.0);
+        let leg = world.lefs[keys[0]].legs[1];
+        let mut rng = SimRng::seed_from_u64(0);
+        assert!(matches!(
+            Action::Switch { leg }.schedule(&world, &RATES, 0.0, &mut rng),
+            Schedule::Never
+        ));
     }
 }

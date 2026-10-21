@@ -216,8 +216,9 @@
      "Respawn",
      "Keyframe",
      "Evict",
-     "CtcfBind",
-     "CtcfRelease"
+     "Switch",
+     "RnapLoad",
+     "RnapOff"
     ]
    }
   ]

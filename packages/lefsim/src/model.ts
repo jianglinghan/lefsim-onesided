@@ -21,8 +21,10 @@ import {
   type Extrusion,
   type Lattice,
   type Lefs,
+  type LoadingSites,
   MOBILITY,
   type Model,
+  type Pol2,
   type Rates,
   type SpawnRule,
   type World,
@@ -83,29 +85,7 @@ export interface LefColumns {
 
 const U32_MAX = 2 ** 32 - 1;
 /** The built-in spawn rules, by name. */
-export const SPAWN_RULES: readonly SpawnRule[] = ["uniform_non_ctcf", "weighted_sites"];
-
-/** Per-site loading weights for {@link createModel} / {@link populate}. */
-export interface SpawnWeights {
-  /** One weight per lattice site: high at loading-rich sites (e.g. NIPBL), 1 as background. */
-  spawnWeight?: ArrayLike<number>;
-}
-
-function checkSpawnWeight(w: ArrayLike<number> | undefined, nSites: number): Float64Array | undefined {
-  if (w === undefined) return undefined;
-  if (w.length !== nSites) {
-    throw new RangeError(`spawnWeight must have one weight per site (${nSites}), got ${w.length}`);
-  }
-  const out = new Float64Array(nSites);
-  for (let i = 0; i < nSites; i++) {
-    const v = Number(w[i]);
-    if (!Number.isFinite(v) || v < 0) {
-      throw new RangeError(`spawnWeight must be non-negative and finite, got ${v} at site ${i}`);
-    }
-    out[i] = v;
-  }
-  return out;
-}
+export const SPAWN_RULES: readonly SpawnRule[] = ["uniform_non_ctcf"];
 /** The extrusion leg-rules, by name. */
 export const EXTRUSIONS: readonly Extrusion[] = ["two_sided", "one_sided"];
 
@@ -273,23 +253,75 @@ export function defaultRates(): Rates {
 
 /**
  * A model: a world, its rates (missing ones take the core's defaults) and a
- * spawn rule. Checked by the core: rates positive and finite, and the
- * spawn rule able to place the world's LEFs.
+ * spawn rule. `pol2` adds Pol II genes: stationary RNAPs loading at the
+ * genes' TSSs, blocking them, and switching a one-sided LEF's legs on
+ * encounter with probability `switchProb`. Checked by the core: rates
+ * positive and finite, the spawn rule able to place the world's LEFs, and
+ * the Pol II config valid.
  */
 export function createModel(
   world: World,
   rates: Partial<Rates> = {},
-  options: { spawnRule?: SpawnRule } & SpawnWeights = {},
+  options: { spawnRule?: SpawnRule; pol2?: Pol2 } = {},
 ): Model {
-  const spawnWeight = checkSpawnWeight(options.spawnWeight, world.lattice.nSites);
   const model: Model = {
     world,
     rates: { ...defaultRates(), ...rates },
-    spawnRule: spawnWeight ? "weighted_sites" : checkSpawnRule(options.spawnRule ?? "uniform_non_ctcf"),
-    spawnWeight,
+    spawnRule: checkSpawnRule(options.spawnRule ?? "uniform_non_ctcf"),
+    pol2: options.pol2 === undefined ? undefined : checkPol2(world, options.pol2),
   };
   check_model(...modelArgs(model));
   return model;
+}
+
+/** Validate a Pol II config against its world: TSSs on the lattice and distinct, positive rates, a probability in [0, 1]. */
+function checkPol2(world: World, pol2: Pol2): Pol2 {
+  const n = world.lattice.nSites;
+  const seen = new Set<number>();
+  for (const g of pol2.genes) {
+    if (!Number.isInteger(g.site) || g.site < 0 || g.site >= n) {
+      throw new RangeError(`gene TSS must be an integer in [0, ${n}), got ${g.site}`);
+    }
+    if (seen.has(g.site)) throw new RangeError(`duplicate gene TSS ${g.site}`);
+    seen.add(g.site);
+    if (!(Number.isFinite(g.kin) && g.kin > 0)) {
+      throw new RangeError(`gene loading rate must be positive and finite, got ${g.kin}`);
+    }
+  }
+  if (pol2.genes.length > 0) {
+    if (!(pol2.switchProb >= 0 && pol2.switchProb <= 1)) {
+      throw new RangeError(`switchProb must be in [0, 1], got ${pol2.switchProb}`);
+    }
+    if (!(Number.isFinite(pol2.off) && pol2.off > 0)) {
+      throw new RangeError(`off must be positive and finite, got ${pol2.off}`);
+    }
+  }
+  return pol2;
+}
+
+/** The core's arguments for a Pol II config: empty arrays for none. */
+export function pol2Args(m: Model): [Uint32Array, Float64Array, number, number] {
+  const pol2 = m.pol2;
+  if (pol2 === undefined) return [new Uint32Array(), new Float64Array(), 0, 0];
+  return [
+    Uint32Array.from(pol2.genes, (g) => g.site),
+    Float64Array.from(pol2.genes, (g) => g.kin),
+    pol2.switchProb,
+    pol2.off,
+  ];
+}
+
+/** The core's arguments for a loading-sites config: an empty array for none. */
+export function loadingArgs(l: LoadingSites | undefined, nSites: number): [Uint32Array, number] {
+  if (l === undefined || l.sites.length === 0) return [new Uint32Array(), 1];
+  if (!(Number.isFinite(l.weight) && l.weight >= 1)) {
+    throw new RangeError(`loading weight must be finite and >= 1, got ${l.weight}`);
+  }
+  const sites = toU32Array(l.sites, "loading sites");
+  for (const s of sites) {
+    if (s >= nSites) throw new RangeError(`loading site must be in [0, ${nSites}), got ${s}`);
+  }
+  return [sites, l.weight];
 }
 
 /** The core's arguments for a model. */
@@ -302,10 +334,7 @@ export function modelArgs(m: Model) {
     r.respawn,
     r.respawnBlocked,
     r.respawnCaptured,
-    r.ctcfOn ?? null,
-    r.ctcfOff ?? null,
     m.spawnRule,
-    m.spawnWeight ?? null,
   ] as const;
 }
 
@@ -313,26 +342,26 @@ export function modelArgs(m: Model) {
  * A world with `nLefs` LEFs placed one at a time by the spawn rule, exactly
  * as respawns place them. `seed` drives only this placement. `extrusion`
  * picks the leg-rule for the landing legs ("two_sided" default, or
- * "one_sided": one leg anchored, the other moving).
+ * "one_sided": one leg anchored, the other moving). `loading` gives
+ * preferential loading sites: plain sites weigh 1 against their `weight`.
  */
 export function populate(
   lattice: Lattice,
   nLefs: number,
-  options: { seed?: number | bigint; spawnRule?: SpawnRule; extrusion?: Extrusion } & SpawnWeights = {},
+  options: { seed?: number | bigint; spawnRule?: SpawnRule; extrusion?: Extrusion; loading?: LoadingSites } = {},
 ): World {
   if (!Number.isInteger(nLefs) || nLefs < 0 || nLefs > U32_MAX) {
     throw new RangeError(`nLefs must be a non-negative integer, got ${nLefs}`);
   }
+  const rule = checkSpawnRule(options.spawnRule ?? "uniform_non_ctcf");
   const extrusion = checkExtrusion(options.extrusion ?? "two_sided");
-  const spawnWeight = checkSpawnWeight(options.spawnWeight, lattice.nSites);
-  const rule = spawnWeight ? "weighted_sites" : checkSpawnRule(options.spawnRule ?? "uniform_non_ctcf");
   const lefs = wasmPopulate(
     ...latticeArgs(lattice),
     nLefs,
     seedBigInt(options.seed),
     rule,
     extrusion,
-    spawnWeight,
+    ...loadingArgs(options.loading, lattice.nSites),
   ) as Lefs;
   return { lattice, lefs };
 }
@@ -373,8 +402,6 @@ export function modelToJson(model: Model, indent?: number | string): string {
       respawn: model.rates.respawn,
       respawn_blocked: model.rates.respawnBlocked,
       respawn_captured: model.rates.respawnCaptured,
-      ctcf_on: model.rates.ctcfOn ?? null,
-      ctcf_off: model.rates.ctcfOff ?? null,
     },
     spawn: { rule: model.spawnRule },
   };
@@ -418,12 +445,7 @@ export function modelFromJson(text: string): Model {
     respawn: field<number>(r, "respawn", "rates"),
     respawnBlocked: field<number>(r, "respawn_blocked", "rates"),
     respawnCaptured: field<number>(r, "respawn_captured", "rates"),
-    ctcfOn: (r as { ctcf_on?: number | null }).ctcf_on ?? undefined,
-    ctcfOff: (r as { ctcf_off?: number | null }).ctcf_off ?? undefined,
   };
   const spawnRule = field<SpawnRule>(field<object>(doc, "spawn", "model"), "rule", "spawn");
-  if (spawnRule === "weighted_sites") {
-    throw new RangeError("model JSON can't hold per-site loading weights; weighted_sites models can't be loaded from JSON");
-  }
   return createModel(world, rates, { spawnRule });
 }
