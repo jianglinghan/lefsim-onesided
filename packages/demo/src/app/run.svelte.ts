@@ -37,8 +37,8 @@ const LEFT = DIRECTION.indexOf("Left");
 const MAX_EVENTS_PER_FRAME = 40_000;
 /** Wall-clock time per frame for a view's sampling, in ms; past it, playback slows. */
 const SAMPLE_BUDGET_MS = 10;
-/** The default density of loop extruders: 20 per 3,000 sites. */
-const LEFS_PER_SITE = 20 / 3000;
+/** The default density of loop extruders: the cr139 orig model's 1 per 50 sites. */
+const LEFS_PER_SITE = 1 / 50;
 
 /** A CTCF; `left` means it captures from the left (its chevron points left). */
 export interface Ctcf {
@@ -56,7 +56,20 @@ const DEFAULT_LAYOUT: readonly { at: number; left: boolean }[] = [
 ];
 
 export const DEFAULT_STRENGTH = 0.8;
-export const DEFAULT_RATES: Readonly<Rates> = { step: 1, respawn: 0.002, respawnBlocked: 0.02, respawnCaptured: 0.002 };
+/**
+ * The cr139 orig (one-sided) model's rates: effective step 0.5 (pause 0.5),
+ * LEF lifetime 200 (uniform death: blocked and held unload at the basal
+ * rate, "stall 不延长寿命"), and dynamic CTCFs at the WT arm's occupancy
+ * (kon = 1/(Cof*10) with Cof=300, koff = 1e-3, ~25% bound).
+ */
+export const DEFAULT_RATES: Readonly<Rates> = {
+  step: 0.5,
+  respawn: 0.005,
+  respawnBlocked: 0.005,
+  respawnCaptured: 0.005,
+  ctcfOn: 1 / 3000,
+  ctcfOff: 0.001,
+};
 
 /** A complete setup for a run: what a tour scene loads (see tour/tour.ts). */
 export interface Preset {
@@ -113,8 +126,8 @@ export class Run {
   nSites = $state(DEFAULT_N_SITES);
   nLefs = $state(DEFAULT_PRESET.nLefs);
   seed = $state(DEFAULT_PRESET.seed);
-  /** The extrusion leg-rule: two-sided, or one-sided with anchored legs. */
-  extrusion = $state<Extrusion>("two_sided");
+  /** The extrusion leg-rule: one-sided by default (the cr139 orig model). */
+  extrusion = $state<Extrusion>("one_sided");
   /** NIPBL loading sites: LEFs load here `loadingBoost` times more than the background. */
   loadings = $state<number[]>([]);
   /** How much likelier a loading site is than a background site (0.05/0.001 = 50 in the cr139 model). */
